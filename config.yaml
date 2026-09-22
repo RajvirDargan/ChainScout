@@ -1,0 +1,589 @@
+# Daily job agent configuration.
+# Edit this file to change what gets searched — no code changes needed.
+
+# Everyone who gets the digest. Add or remove a line to change the distribution.
+recipients:
+  - you@example.com
+timezone: Europe/Amsterdam
+
+# The digest should land in the morning, but the machine is often asleep or off at
+# 07:30. launchd fires at this time, at login, and hourly as a catch-up net; `daily`
+# is idempotent, so the first trigger at or after this time wins and the rest no-op.
+schedule:
+  earliest_hour: 7
+  earliest_minute: 30
+
+# 07:30 is usually right as the machine wakes from overnight sleep, before Wi-Fi has
+# reconnected — DNS lookups fail for the first several minutes, and since the top
+# priority geography is queried first in every source loop it takes the brunt of it.
+# Wait for this host to resolve before scanning anything, up to timeout_seconds, then
+# proceed anyway so a longer real outage still degrades gracefully instead of
+# blocking the digest.
+network:
+  check_host: api.adzuna.com
+  timeout_seconds: 150
+  interval_seconds: 10
+
+thresholds:
+  apply_now: 70       # "Apply now" section
+  worth_look: 55      # "Worth a look"
+  watchlist: 45       # one-liner watchlist; below this is stored but never emailed
+  max_jobs_email: 20
+  # The top-priority geography gets a guaranteed floor of slots in the email rather
+  # than having to out-score the rest of the world for every place. Slots above this
+  # floor are still won on score alone.
+  min_priority_geo_slots: 10
+  # Cold-start guard: how many candidates go to the scorer in one run. Anything over
+  # this is left undiscovered and resurfaces next run rather than being buried.
+  # Tune this up if a high-volume geography (e.g. a large home-country LinkedIn pass)
+  # is drawing too few slots against a queue it can't work through inside the
+  # freshness window — the cap is spent round-robin across all configured
+  # geographies, so raising it doesn't disadvantage the top-priority one.
+  max_candidates_per_run: 120
+
+deadlines:
+  # Drives the countdown in the email header. Point this at whatever real deadline
+  # matters for your situation (a permit filing date, a visa expiry, an offer
+  # deadline) — once it passes, the countdown reads as elapsed rather than ticking
+  # negative. See render.py.
+  sponsor_filing: 2026-12-31
+  permit_expiry: 2026-12-31
+
+# ------------------------------------------------------------------------- LLM
+# Scoring and the extraction fallback both run through here. The Antigravity CLI is
+# preferred because it authenticates against the operator's own plan; the Gemini API
+# key is rate-limited hard (gemini-3.8-flash reports 20 requests/day on the free
+# tier, and 3.7-flash alone completed only 2 of 9 requests under sustained load).
+llm:
+  backend: antigravity        # antigravity | gemini_api
+  batch_size: 10              # jobs per scoring call — ~9 calls/day instead of ~210
+  antigravity:
+    # Absolute path on purpose: launchd gets no shell profile, so "agy" alone
+    # resolves in your terminal but NOT in a scheduled run.
+    binary: /Users/YOUR_USERNAME/.local/bin/agy
+    # The model originally asked for. The API key caps gemini-3.8-flash at 20
+    # requests/day; the Antigravity plan exposes it in three reasoning tiers,
+    # and "-high" is the extended-thinking one.
+    # -low measured 16s per 10-job batch vs 50-78s for -medium, with the SAME
+    # seniority judgement (it scored a 5-year role 19 vs medium's 15).
+    # Swap to gemini-3.8-flash-medium or -high here if you want more reasoning.
+    model: gemini-3.8-flash-low
+    timeout_seconds: 900
+  gemini_api:                 # fallback when agy is absent or not logged in
+    # Fastest and most reliable FIRST: the fallback exists to rescue a run, so it must
+    # not be the slow path. Measured on a 10-job batch: flash-lite 5s and always
+    # answered; 3.5-flash 41s; 3.7-flash returned 429 under load.
+    model_preference:
+      - gemini-3.5-flash-lite
+      - gemini-3.6-flash
+      - gemini-3.5-flash
+      - gemini-3.7-flash
+    # gemini-3.8-flash is deliberately absent: 20 requests/day, measured under load.
+
+# ---------------------------------------------------------------- spend controls
+# Every metered API reserves against this ledger before it calls. A cap that is
+# reached makes the caller SKIP, not fail. Added after a single unattended run
+# spent 324 Firecrawl credits out of a 1,000/month allowance.
+sources:
+  adzuna:
+    enabled: true
+    # 28 calls/day: top-priority geo 10 (full title list) + 3 more geos at 5 each +
+    # a fallback geo at 3, all at 50 results each. Some geographies come from
+    # LinkedIn instead when Adzuna has no index for them. 28/day = 840/month.
+    daily_calls: 30          # headroom for a retry, not for another geography
+    monthly_calls: 900       # free tier is ~1,000; leaves real headroom
+  gemini:
+    enabled: true
+    model: gemini-3.5-flash-lite   # verified against the live model list; older gens retire fast
+    daily_requests: 400
+  antigravity:
+    enabled: true            # plan-backed, not API-metered; cap guards runaway loops
+    daily_calls: 80
+  linkedin:
+    enabled: true            # free, but rate-limited — cap the call volume
+    # Budget: geo A 6x1x2=12 + geo B 6x1x2=12 + fallback geo 5 titles x 4 cities x 2
+    # pages=40 = 64, leaving headroom for a retry. This is someone else's
+    # unauthenticated endpoint — if 429s start appearing, cut the city list before
+    # raising this again.
+    daily_calls: 70
+  firecrawl:
+    enabled: false           # OFF. Set enabled:true + a monthly cap to re-enable.
+    monthly_credits: 0
+
+firecrawl:
+  api_base: https://api.firecrawl.dev
+  results_per_query: 10
+  # qdr:d proved far too tight (often 0 hits). Dedup means a wider window costs
+  # nothing but repeat work, so the daily pass looks back a week and Mondays a month.
+  freshness: "qdr:w"
+  freshness_weekly: "qdr:m"
+  # scrapeOptions bills PER SCRAPED RESULT, not per query — it cost 10 credits a
+  # query against 2 for search alone. Page content now comes from src/extract.py
+  # over plain requests, which is free. Leave this off.
+  scrape: false
+  max_queries_per_run: 40
+  timeout_seconds: 120
+  # Some ATS boards stub out the description (some return "<p>x</p>" and nothing
+  # else). Those postings get scraped individually so they can still be scored.
+  enrich_thin_ats: true
+  max_enrich_per_run: 25
+
+# ---------------------------------------------------------------- search terms
+
+titles:
+  core:
+    - logistics engineer
+    - logistics process engineer
+    - operations engineer
+    - supply chain engineer
+    - supply chain analyst
+    - logistics analyst
+    - industrial engineer
+    - process engineer supply chain
+  adjacent:
+    - customs compliance specialist
+    - trade compliance specialist
+    - warehouse operations engineer
+    - continuous improvement engineer
+    - operations analyst
+    - supply chain planner
+    - inventory analyst
+    - transport coordinator
+    - fulfilment operations analyst
+
+# Adzuna's `what` is AND-matched, so one title per call is the precise form:
+# `what_or` across titles returned hotel managers and sales reps (thousands of hits
+# of noise, in testing). Each call returns up to 50 results for 1 quota unit.
+adzuna:
+  max_days_old: 7
+  results_per_page: 50
+  # Per geography, one call per title. The top-priority geography gets the full
+  # list, lower-priority ones a shorter one.
+  titles:
+    - logistics engineer
+    - logistics process engineer
+    - supply chain engineer
+    - supply chain analyst
+    - logistics analyst
+    - operations engineer
+    - industrial engineer
+    - customs compliance
+    - trade compliance
+    - supply chain planner
+  titles_secondary:            # used for lower-priority geographies
+    - logistics engineer
+    - supply chain analyst
+    - logistics analyst
+    - operations engineer
+    - supply chain planner
+
+# LinkedIn's public guest search — a free source that reaches markets Adzuna has no
+# index for at all (probed live: some country codes 404 outright).
+linkedin:
+  days: 7
+  pages_per_query: 2       # ~10 cards a page; shallow on purpose
+  delay_seconds: 1.5       # this is someone else's service — stay polite
+  # A high-volume geography like India is NOT here because Adzuna cannot reach that
+  # country — its index works fine — but because Adzuna under-indexes the junior and
+  # internship market there. In one comparison sweep, LinkedIn surfaced most of the
+  # top postings that Adzuna missed for junior/intern titles specifically.
+  geographies: [ie, uae, india]
+  titles:
+    - logistics engineer
+    - supply chain analyst
+    - logistics coordinator
+    - supply chain planner
+    - customs compliance
+    - operations analyst
+
+geographies:
+  # Ordered by permit-route viability for the example candidate in PROFILE.md — not
+  # by market size. Adjust this list and ordering to match your own situation; see
+  # PROFILE.md §1 "Geography priority" for how the ordering should be reasoned about.
+  #
+  # Probe each Adzuna country index live before relying on it — some return a real
+  # index, others 404 (no index at all), in which case serve that geography from
+  # LinkedIn instead.
+
+  - id: nl
+    label: Netherlands
+    priority: 1              # TOP PRIORITY — gets the full adzuna.titles list
+    firecrawl_location: Netherlands
+    # Restricting to these collapsed every result to LinkedIn and lost direct
+    # employer sites (careers.jnj.com etc). Left here for reference; set
+    # use_include_domains: true to re-enable.
+    use_include_domains: false
+    include_domains:
+      - nl.indeed.com
+      - linkedin.com
+      - nationalevacaturebank.nl
+      - magnet.me
+      - jobbird.com
+      - werkzoeken.nl
+      - undutchables.nl
+      - togetherabroad.nl
+    extra_terms: ["Netherlands", "Eindhoven", "Amsterdam", "vacature Nederland"]
+    visa_mode: ind_sponsor   # apply the IND register + statutory recent-graduate floor
+    salary_floor_month: 3122.0
+    salary_floor_label: IND
+
+  - id: de
+    label: Germany
+    priority: 2              # strongest non-NL route (sec. 18b has no salary floor)
+    firecrawl_location: Germany
+    linkedin_location: Germany
+    use_include_domains: false
+    include_domains:
+      - de.indeed.com
+      - linkedin.com
+      - stepstone.de
+      - xing.com
+    extra_terms: ["Germany", "Deutschland", "Berlin", "Munchen", "Hamburg"]
+    visa_mode: skilled_worker_18b
+    # These five are the highest-yield German terms found in a live title-yield
+    # probe — check what actually returns volume in your target market rather than
+    # assuming the core title list translates directly.
+    adzuna_titles:
+      - supply chain engineer
+      - operations engineer
+      - industrial engineer
+      - trade compliance
+      - customs compliance
+    # No floor on purpose. Sec. 18b(1) Skilled Worker has NO statutory salary minimum
+    # for applicants under 45 — only a Federal Employment Agency check that pay is
+    # customary for the role and region. The EU Blue Card figures are an upgrade
+    # path, not a gate. Scoring a floor here would wrongly penalise a route that
+    # doesn't actually have one.
+    salary_floor_month: null
+
+  - id: be
+    label: Belgium
+    priority: 3
+    firecrawl_location: Belgium
+    linkedin_location: Belgium
+    use_include_domains: false
+    include_domains:
+      - be.indeed.com
+      - linkedin.com
+      - vdab.be
+      - stepstone.be
+    extra_terms: ["Belgium", "Antwerp", "Antwerpen", "Brussels", "Gent"]
+    visa_mode: single_permit_flanders
+    # Belgian vocabulary, found via a live title-yield probe: the default title list
+    # is near-dead here. These five returned meaningfully more results.
+    adzuna_titles:
+      - operations engineer
+      - supply chain planner
+      - transport planner
+      - logistics specialist
+      - supply chain specialist
+    # Flanders highly-skilled single permit, UNDER-30 reduced rate. Check the current
+    # figure — it's age-bounded and revised periodically. Flag roles that fall under it.
+    salary_floor_month: 3260.80
+    salary_floor_label: Flanders under-30
+
+  - id: ie
+    label: Ireland
+    priority: 4
+    firecrawl_location: Ireland
+    linkedin_location: Ireland
+    use_include_domains: false
+    include_domains:
+      - ie.indeed.com
+      - linkedin.com
+      - irishjobs.ie
+      - jobs.ie
+    extra_terms: ["Ireland", "Dublin", "Cork", "Limerick"]
+    visa_mode: general_employment_permit
+    # General Employment Permit floor — check the current DETE figure. Critical
+    # Skills routes need a much higher salary or a CSOL listing, out of reach for a
+    # junior candidate. DETE's rule is that occupations are eligible UNLESS on the
+    # Ineligible List — so the legal route is often open and the real blocker is the
+    # 28-day Labour Market Needs Test, which employers rarely run for junior hires.
+    # That's a scoring penalty in PROFILE.md, not a prescreen reject.
+    salary_floor_month: 3050.42
+    salary_floor_label: Irish GEP
+
+  - id: pl
+    label: Poland
+    priority: 5
+    firecrawl_location: Poland
+    linkedin_location: Poland
+    use_include_domains: false
+    include_domains:
+      - pl.indeed.com
+      - linkedin.com
+      - pracuj.pl
+      - nofluffjobs.com
+    extra_terms: ["Poland", "Krakow", "Wroclaw", "Gdansk", "Warsaw"]
+    visa_mode: work_permit_type_a
+    # Polish vocabulary, found via a live title-yield probe: the default title list
+    # returned near-zero — the Krakow/Wroclaw SSC belt advertises by process name and
+    # "specialist" rather than "engineer"/"analyst". These returned far more.
+    adzuna_titles:
+      - logistics specialist
+      - supply chain specialist
+      - order to cash
+      - trade compliance
+      - customs specialist
+    # Type A work permit has no high threshold — statutory minimum wage only. Skip
+    # the Blue Card route here (well above a junior salary). The draw is the
+    # Krakow/Wroclaw/Gdansk shared-service belt: probably the largest concentration
+    # of ENGLISH-language junior supply chain roles in the EU, with an ERP system
+    # (e.g. SAP S/4HANA) as the core requirement.
+    salary_floor_month: null
+
+  - id: uae
+    label: Dubai / Middle East
+    priority: 6
+    firecrawl_location: United Arab Emirates
+    linkedin_location: United Arab Emirates
+    use_include_domains: false
+    include_domains:
+      - bayt.com
+      - naukrigulf.com
+      - gulftalent.com
+      - linkedin.com
+    extra_terms: ["Dubai", "Abu Dhabi", "UAE"]
+    visa_mode: sponsorship_mentioned
+    salary_floor_month: null
+
+  - id: india
+    label: India
+    priority: 7
+    firecrawl_location: India
+    use_include_domains: false
+    include_domains:
+      - naukri.com
+      - linkedin.com
+      - instahyre.com
+      - foundit.in
+    extra_terms: ["Mumbai", "Pune", "Delhi NCR", "Gurgaon"]
+    visa_mode: none
+    # This id is the no-visa fallback geography — swap in whatever your own home
+    # country's job boards and cities are; note that a few source modules
+    # (adzuna.py, render.py, indeed.py) key off this id directly rather than reading
+    # it generically, so renaming it means updating those too. Trimmed to a few
+    # titles here to keep the daily Adzuna budget in check.
+    adzuna_titles:
+      - supply chain analyst
+      - logistics analyst
+      - supply chain planner
+    # LinkedIn's guest search caps a query near 20 cards and weights location hard,
+    # so several city queries beat one country query several times over. A high-volume
+    # local market may advertise junior work as "executive"/"trainee" rather than
+    # "engineer"/"analyst" — probe live before assuming the core title list carries over.
+    linkedin_titles:
+      - supply chain analyst
+      - logistics executive
+      - supply chain intern
+      - operations intern
+      - trade compliance
+    # Ordered by whichever city is cheapest for the candidate to relocate to first —
+    # adjust to your own situation.
+    linkedin_locations:
+      - "Gurugram, Haryana, India"
+      - "Delhi, India"
+      - "Mumbai, Maharashtra, India"
+      - "Bengaluru, Karnataka, India"
+    salary_floor_month: null
+
+# ------------------------------------------------------- direct ATS board pulls
+# Free, structured and exact — these carry the load so Firecrawl credits go to
+# discovery. Add a company by appending one line. Unknown/renamed boards are skipped
+# with a warning.
+
+ats:
+  # Probe boards live before relying on them — token names sometimes resolve to an
+  # unrelated company entirely (double-check posting locations before adding one),
+  # and plenty of well-known companies simply have no board at the guessed token.
+  greenhouse:              # boards-api.greenhouse.io/v1/boards/<token>/jobs
+    - flexport             # freight forwarding & customs brokerage
+    - hellofresh           # high-volume supply chain ops
+    - bolcom               # NL e-commerce fulfilment
+    - catawiki              # NL marketplace ops
+    - adyen                 # NL, occasional ops/analytics roles
+  lever: []                # api.lever.co/v0/postings/<slug>
+  recruitee:               # <slug>.recruitee.com/api/offers
+    - shypple              # Rotterdam digital freight forwarder
+    - channelengine         # NL e-commerce integration
+  # ATS slugs are lowercase tokens; these are what the email should show.
+  display_names:
+    flexport: Flexport
+    hellofresh: HelloFresh
+    bolcom: bol.
+    catawiki: Catawiki
+    adyen: Adyen
+    shypple: Shypple
+    channelengine: ChannelEngine
+
+  # Keyword gate applied to ATS titles before anything else.
+  title_keywords:
+    - logistic
+    - supply chain
+    - operations
+    - warehouse
+    - fulfil
+    - fulfill
+    - customs
+    - trade compliance
+    - freight
+    - transport
+    - inventory
+    - process engineer
+    - industrial engineer
+    - continuous improvement
+    - planner
+    - analyst
+    # A high-volume junior market may advertise as "trainee"/"apprentice" rather
+    # than "engineer"/"analyst" — without these, a keyword gate like this one can
+    # silently drop the highest-scoring posting of a whole sweep.
+    - trainee
+    - apprentice
+    - procurement
+    - sourcing
+    - distribution
+    - scheduling
+    - shipping
+    - import
+    - export
+
+# ------------------------------------------------------------- prescreen gates
+
+prescreen:
+  # The candidate's hard ceiling: see PROFILE.md §1 "Experience". Anything above is
+  # rejected outright rather than flagged — they cannot apply to it.
+  max_years_experience: 3
+
+  # Seniority, in two tiers. A flat "manager" ban would also kill "Management Trainee",
+  # which is exactly the kind of graduate scheme a junior candidate wants, hence the
+  # junior override.
+  reject_seniority_always:
+    - senior
+    - "sr."
+    - "sr "
+    - lead
+    - principal
+    - "staff "
+    - head of
+    - director
+    - vice president
+    - "vp "
+    - chief
+    - hoofd
+  reject_seniority_unless_junior:
+    - manager
+    - supervisor
+    - teamleider
+    # "management" is NOT here: it is a domain word far more often than a rank
+    # ("Disturbance Management", "Warehouse Management Systems", "Inventory Management").
+    # "executive" is NOT here either: in some markets it commonly denotes a junior
+    # individual contributor, so the LLM scorer judges it on stated years instead.
+
+  # Titles containing these phrases skip the seniority check — the word is domain
+  # vocabulary, not a rank.
+  seniority_false_positives:
+    - disturbance management
+    - lead time
+    - management system
+    - inventory management
+    - warehouse management
+    - supply chain management
+    - order management
+    - transport management
+    - data management
+    - category management
+    - vendor management
+    - quality management
+    - project management office
+  junior_markers:
+    - trainee
+    - graduate
+    - junior
+    - entry level
+    - starter
+    - starters
+    - "associate "
+    - afstudeer
+
+  # Title contains any of these -> reject outright, never shown to the scorer.
+  reject_title_terms:
+    - senior manager
+    - director
+    - head of
+    - vice president
+    - chief
+    - principal
+    - "vp "
+    - nurse
+    - chef
+    - driver
+    - chauffeur
+    - heftruck
+    - forklift operator
+    - warehouse operative
+    - orderpicker
+    - sales representative
+    - account executive
+    - recruiter
+    - teacher
+    - docent
+    - stagiair
+    # Nationality-restricted roles are a categorical bar for a non-national
+    # candidate, same class as "native [language] required" — adjust this list to
+    # whichever markets and nationality clauses apply to your own situation.
+    - uae national
+    - uae nationals
+    - emirati national
+    - saudi national
+    - emiratisation
+    - emiratization
+    - saudisation
+    - saudization
+  # Body contains any of these -> flagged, not rejected. The scorer decides.
+  flag_body_terms:
+    # Local-language requirements. Match these to PROFILE.md's stated languages: a
+    # fluency requirement in a language the candidate doesn't have is close to
+    # disqualifying — but the scorer decides, because plenty of postings list the
+    # local language as "a plus".
+    - fliessend deutsch
+    - fließend deutsch
+    - deutschkenntnisse
+    - verhandlungssicheres deutsch
+    - sehr gute deutschkenntnisse
+    - gute deutschkenntnisse
+    - deutsch erforderlich
+    - francais courant
+    - français courant
+    - maitrise du francais
+    - nederlands vereist
+    - jezyk polski
+    - język polski
+    - polish language required
+    - fluent polish
+    - fluent german
+    - fluent dutch
+    - vloeiend nederlands
+    - dutch is required
+    - dutch speaking
+    - nederlands sprekend
+    - must have eu work
+    - no visa sponsorship
+    - eu passport required
+    - uae nationals only
+    - emiratisation
+    - emiratization
+    - must be a uae national
+    - open to uae nationals
+  min_body_chars: 300      # below this the page probably isn't a real posting
+
+ind_register:
+  # Public register of recognised sponsors (regular labour + highly skilled migrants).
+  # Served as one large inline HTML table, not a downloadable file.
+  url: https://ind.nl/en/public-register-recognised-sponsors/public-register-regular-labour-and-highly-skilled-migrants
+  refresh_days: 7
+  match_ratio: 0.88        # difflib ratio for fuzzy company matching
+
+dedup:
+  fuzzy_ratio: 0.92
+  lookback_days: 90

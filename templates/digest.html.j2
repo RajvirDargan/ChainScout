@@ -1,0 +1,123 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f5f7;">
+<div style="max-width:680px;margin:0 auto;padding:20px 14px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#1a1d21;">
+
+  <div style="background:{{ '#1a3a5c' if channel == 'indeed' else ('#8a1c1c' if days_to_filing <= 14 else '#1a1d21') }};color:#fff;border-radius:10px;padding:16px 18px;margin-bottom:18px;">
+    <div style="font-size:19px;font-weight:700;letter-spacing:-.2px;">{{ total_new }} new {{ 'role' if total_new == 1 else 'roles' }} today</div>
+    <div style="font-size:13px;opacity:.85;margin-top:5px;">{{ run_date_human }}
+      {%- if apply_now|length %} · <strong>{{ apply_now|length }} worth applying to now</strong>{% endif %}</div>
+    <div style="font-size:13px;margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.22);">
+      {% if channel == 'indeed' %}<strong>Indeed · India only</strong> — scored on the same rubric as the daily digest; Delhi NCR first, then Mumbai
+      {% elif days_to_filing > 0 %}<strong>{{ days_to_filing }} days</strong> until the 15 Sept sponsor-filing deadline
+      {% else %}Filing deadline has passed — see VISA_briefing.md for the leniency window{% endif %}
+    </div>
+  </div>
+
+  {% if is_test %}
+  <div style="background:#fff4d6;border:1px solid #e0b849;border-radius:8px;padding:11px 14px;margin-bottom:18px;font-size:13px;">
+    <strong>Test run.</strong> Nothing here has been marked as sent — every one of these roles
+    will appear again in the first real digest. Reply if the format needs changing.
+  </div>
+  {% endif %}
+
+  {% macro job_card(job, accent) %}
+  <div style="background:#fff;border:1px solid #e3e5e8;border-left:4px solid {{ accent }};border-radius:8px;padding:14px 16px;margin-bottom:11px;">
+    <table role="presentation" width="100%" style="border-collapse:collapse;"><tr>
+      <td style="vertical-align:top;">
+        <a href="{{ job.url }}" style="font-size:16px;font-weight:650;color:#0b5cad;text-decoration:none;line-height:1.35;">{{ job.title }}</a>
+        <div style="font-size:13.5px;color:#3d4248;margin-top:4px;">
+          <strong>{{ job.company }}</strong>{% if job.location %} · {{ job.location }}{% endif %}
+        </div>
+      </td>
+      <td style="vertical-align:top;text-align:right;width:52px;padding-left:10px;">
+        <span style="display:inline-block;background:{{ accent }};color:#fff;font-size:14px;font-weight:700;border-radius:14px;padding:3px 10px;">{{ job.score }}</span>
+      </td>
+    </tr></table>
+
+    {% if job.rationale %}<div style="font-size:13.5px;color:#22262b;margin-top:9px;line-height:1.5;">{{ job.rationale }}</div>{% endif %}
+
+    {% if job.flags %}
+    <div style="margin-top:9px;">
+      {% for flag in job.flags %}
+      <span style="display:inline-block;font-size:11.5px;background:{{ '#fdecec' if flag.severity == 'bad' else ('#eaf6ec' if flag.severity == 'good' else '#f0f1f3') }};color:{{ '#8a1c1c' if flag.severity == 'bad' else ('#1c6b2e' if flag.severity == 'good' else '#4a5058') }};border-radius:4px;padding:2.5px 7px;margin:0 4px 4px 0;">{{ flag.text }}</span>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <div style="margin-top:11px;font-size:12.5px;">
+      <a href="{{ job.url }}" style="color:#0b5cad;text-decoration:none;font-weight:600;">Open posting →</a>
+      <span style="color:#9aa0a6;"> · {{ job.source }}{% if job.posted_human %} · {{ job.posted_human }}{% endif %}</span>
+    </div>
+  </div>
+  {% endmacro %}
+
+  {% macro section(heading, jobs, accent, blurb) %}
+  {% if jobs|length %}
+  <div style="font-size:12px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;color:#5a6169;margin:22px 0 9px;">
+    {{ heading }} <span style="color:#9aa0a6;font-weight:500;">({{ jobs|length }})</span>
+  </div>
+  {% if blurb %}<div style="font-size:12.5px;color:#6b7178;margin:-4px 0 10px;">{{ blurb }}</div>{% endif %}
+  {% for job in jobs %}{{ job_card(job, accent) }}{% endfor %}
+  {% endif %}
+  {% endmacro %}
+
+  {% macro group_heading(title, count, blurb) %}
+  <div style="margin:26px 0 12px;padding:10px 12px;background:#f4f6f8;border-left:4px solid #1a3d6d;border-radius:3px;">
+    <div style="font-size:15px;font-weight:700;color:#12233d;">{{ title }}
+      <span style="color:#6b7178;font-weight:500;">({{ count }})</span></div>
+    <div style="font-size:12.5px;color:#5b6169;margin-top:2px;">{{ blurb }}</div>
+  </div>
+  {% endmacro %}
+
+  {% if nl_total %}
+  {{ group_heading('Netherlands', nl_total, 'First priority — the preferred outcome, and the only roles that can still affect the 15 Sept filing deadline.') }}
+  {{ section('Apply now', nl_apply, '#1c6b2e', 'Strong fit and the visa maths works.') }}
+  {{ section('Worth a look', nl_worth, '#b8860b', 'Good fit with a caveat — read the flags.') }}
+  {% if nl_watch|length %}
+  {{ section('Watchlist', nl_watch, '#8a9099', 'Scored low but kept in view.') }}
+  {% endif %}
+  {% endif %}
+
+  {% if other_total %}
+  {% if channel == 'indeed' %}
+  {{ group_heading('India — via Indeed', other_total, 'New Indeed postings not already sent in the daily digest. Delhi NCR scores highest, then Mumbai.') }}
+  {% else %}
+  {{ group_heading('Beyond the Netherlands', other_total, 'Germany · Belgium · Ireland · Poland · Dubai/ME · India — ordered by how viable the work permit is for you.') }}
+  {% endif %}
+  {{ section('Apply now', other_apply, '#1c6b2e', 'Strong fit and the visa maths works.') }}
+  {{ section('Worth a look', other_worth, '#b8860b', 'Good fit with a caveat — read the flags.') }}
+  {% endif %}
+
+  {% if other_watch|length %}
+  <div style="font-size:12px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;color:#5a6169;margin:22px 0 9px;">
+    Watchlist — elsewhere <span style="color:#9aa0a6;font-weight:500;">({{ other_watch|length }})</span>
+  </div>
+  <div style="background:#fff;border:1px solid #e3e5e8;border-radius:8px;padding:11px 15px;">
+    {% for job in other_watch %}
+    <div style="font-size:13px;padding:5px 0;{% if not loop.last %}border-bottom:1px solid #f0f1f3;{% endif %}">
+      <span style="color:#9aa0a6;font-variant-numeric:tabular-nums;">{{ job.score }}</span>
+      &nbsp;<a href="{{ job.url }}" style="color:#0b5cad;text-decoration:none;">{{ job.title }}</a>
+      <span style="color:#6b7178;"> — {{ job.company }}{% if job.location %}, {{ job.location }}{% endif %}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if not (apply_now or worth_look or watchlist) %}
+  <div style="background:#fff;border:1px solid #e3e5e8;border-radius:8px;padding:22px;text-align:center;color:#6b7178;font-size:14px;">
+    No new roles cleared the bar today.<br>
+    <span style="font-size:12.5px;">{{ scanned }} postings scanned, all either already sent or scored below {{ watchlist_threshold }}.</span>
+  </div>
+  {% endif %}
+
+  <div style="margin-top:26px;padding-top:14px;border-top:1px solid #dcdfe3;font-size:11.5px;color:#8a9099;line-height:1.6;">
+    {{ scanned }} postings scanned · {{ total_new }} new after deduplication · {{ sources_line }}<br>
+    {% if llm_usage %}Scored by {{ llm_usage }}.<br>{% endif %}
+    Scored against your_cv.pdf. Nothing here repeats a role from an earlier digest.<br>
+    job_agent · ~/Downloads/10_job_applications/job_agent
+  </div>
+</div>
+</body>
+</html>
