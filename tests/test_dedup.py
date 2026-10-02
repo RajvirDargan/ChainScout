@@ -455,3 +455,84 @@ def test_junior_marker_rescues_the_manager_family():
 def test_junior_marker_does_not_rescue_an_explicit_senior_title():
     keep, reason, _ = _screen("Senior Associate, Logistics")
     assert not keep and reason == "seniority:senior"
+
+
+# ------------------------------------------------- dedup must not over-collapse
+
+def test_the_same_title_in_two_countries_is_two_jobs():
+    s = _store()
+    s.insert_new(job("DHL", "Logistics Analyst", "Hamburg, Germany",
+                     "https://dhl.com/job/de-1", geo="de"))
+    poland = job("DHL", "Logistics Analyst", "Krakow, Poland", "https://dhl.com/job/pl-1",
+                 geo="pl")
+    assert s.is_known(poland) is None
+
+
+def test_the_same_title_in_two_cities_is_two_jobs():
+    s = _store()
+    s.insert_new(job("DHL", "Logistics Analyst", "Hamburg", "https://dhl.com/job/1", geo="de"))
+    assert s.is_known(job("DHL", "Logistics Analyst", "Munich",
+                          "https://dhl.com/job/2", geo="de")) is None
+
+
+def test_one_letter_company_names_are_different_employers():
+    s = _store()
+    s.insert_new(job("ABB", "Logistics Analyst", "Rotterdam", "https://abb.com/job/1"))
+    assert s.is_known(job("ABC", "Logistics Analyst", "Rotterdam",
+                          "https://abc.com/job/1")) is None
+
+
+def test_an_internship_is_not_the_full_time_role():
+    s = _store()
+    s.insert_new(job("Acme", "Supply Chain Analyst", "Utrecht", "https://acme.nl/job/1"))
+    assert s.is_known(job("Acme", "Supply Chain Analyst Intern", "Utrecht",
+                          "https://acme.nl/job/2")) is None
+
+
+def test_a_spelling_variant_of_the_company_still_dedups():
+    s = _store()
+    s.insert_new(job("Kuehne + Nagel", "Logistics Analyst", "Venlo", "https://kn.com/job/1"))
+    assert s.is_known(job("Kühne+Nagel", "Logistics Analyst", "Venlo, Limburg",
+                          "https://nl.indeed.com/viewjob?jk=k")) is not None
+
+
+def test_a_country_suffix_does_not_change_the_fingerprint():
+    assert nz.fingerprint("DHL", "Logistics Analyst", "Hamburg") \
+        == nz.fingerprint("DHL GmbH", "Logistics Analyst (m/w/d)", "Hamburg, Germany")
+
+
+def test_a_v1_keyed_row_is_still_recognised():
+    """Rows stored before the v2 fingerprint must keep suppressing re-sends."""
+    s = _store()
+    j = job("Coolblue", "Supply Chain Analyst", "Tilburg", "https://coolblue.nl/job/old")
+    legacy = nz.fingerprint_v1(j["company"], j["title"], j["location"])
+    s.conn.execute("INSERT INTO jobs (fingerprint, canonical_url, url, company, title, "
+                   "location, geo, first_seen, last_seen, status) VALUES "
+                   "(?,?,?,?,?,?,?,datetime('now'),datetime('now'),'sent')",
+                   (legacy, j["canonical_url"], j["url"], j["company"], j["title"],
+                    j["location"], "nl"))
+    again = job("Coolblue", "Supply Chain Analyst", "Tilburg", "https://indeed.nl/viewjob?jk=1")
+    assert s.is_known(again) is not None
+
+
+def test_a_role_reposted_after_the_lookback_resurfaces():
+    s = _store()
+    j = job("Acme", "Logistics Engineer", "Breda", "https://acme.nl/job/le-old")
+    fp = s.insert_new(j)
+    s.mark_sent([fp], "2026-01-05")
+    s.conn.execute("UPDATE jobs SET last_seen = '2026-01-05T08:00:00+00:00'")
+    repost = job("Acme", "Logistics Engineer", "Breda", "https://acme.nl/job/le-new")
+    assert s.is_known(repost, lookback_days=90) is None
+    assert s.insert_new(repost) == fp
+    assert [c["fingerprint"] for c in s.unsent_carry_forward(set())] == [fp]
+    assert s.is_known(repost) is not None, "and from then on it is known again"
+
+
+def test_a_role_still_listed_never_counts_as_a_repost():
+    s = _store()
+    j = job("Acme", "Logistics Engineer", "Breda", "https://acme.nl/job/le-1")
+    fp = s.insert_new(j)
+    s.mark_sent([fp], "2026-01-05")
+    s.touch(fp)                                      # seen again this morning
+    assert s.is_known(job("Acme", "Logistics Engineer", "Breda",
+                          "https://jobs.nl/x")) is not None

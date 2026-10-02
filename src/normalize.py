@@ -101,24 +101,22 @@ def canonical_url(url: str) -> str:
     return urlunparse((p.scheme or "https", netloc, path, "", urlencode(sorted(kept)), ""))
 
 
-def normalize_title(title: str) -> str:
+# --- v1 keys. Frozen: rows stored before the v2 fingerprint are keyed by these, and
+# store.is_known still looks them up so no already-sent role resurfaces.
+
+def _normalize_title_v1(title: str) -> str:
     t = SENIORITY_NOISE.sub(" ", title or "")
     t = re.sub(r"[^a-z0-9 ]+", " ", t.lower())
     return re.sub(r"\s+", " ", t).strip()
 
 
-def normalize_company(company: str) -> str:
-    c = re.sub(
-        r"\b(b\.?v\.?|n\.?v\.?|gmbh|ltd|limited|inc|llc|s\.?a\.?|group|holding|"
-        r"nederland|netherlands|europe|international|careers)\b",
-        " ",
-        (company or "").lower(),
-    )
+def _normalize_company_v1(company: str) -> str:
+    c = re.sub(_COMPANY_SUFFIXES, " ", (company or "").lower())
     c = re.sub(r"[^a-z0-9 ]+", " ", c)
     return re.sub(r"\s+", " ", c).strip()
 
 
-def normalize_city(location: str) -> str:
+def _normalize_city_v1(location: str) -> str:
     loc = (location or "").lower()
     for city in CITY_HINTS:
         if city in loc:
@@ -126,9 +124,88 @@ def normalize_city(location: str) -> str:
     return re.sub(r"[^a-z ]+", " ", loc).strip()[:40]
 
 
+def fingerprint_v1(company: str, title: str, location: str) -> str:
+    key = (f"{_normalize_company_v1(company)}|{_normalize_title_v1(title)}|"
+           f"{_normalize_city_v1(location)}")
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()
+
+
+# --- v2 keys.
+
+_COMPANY_SUFFIXES = (r"\b(b\.?v\.?|n\.?v\.?|gmbh|ltd|limited|inc|llc|s\.?a\.?|group|holding|"
+                     r"nederland|netherlands|europe|international|careers)\b")
+
+# Words that only re-label the same vacancy across boards (rank, hours, gender tags).
+TITLE_NOISE = re.compile(
+    r"\b(junior|jr|senior|sr|medior|entry[- ]level|stage|fulltime|full[- ]time|parttime|"
+    r"part[- ]time|m/v/x|m/v|m/w/d|f/m/d|w/m/d|h/f|\d+\s*(?:uur|hours|hrs)|per\s+week)\b",
+    re.I)
+# Words that make it a DIFFERENT vacancy. v1 stripped "intern", "trainee" and "graduate"
+# along with the rank noise, so "Supply Chain Analyst Intern" and "Supply Chain Analyst"
+# at the same company collapsed into one job and the internship was never shown.
+_JOB_KIND = {
+    "intern": "intern", "internship": "intern", "stagiair": "intern",
+    "afstudeerstage": "intern", "afstudeeropdracht": "intern",
+    "trainee": "trainee", "traineeship": "trainee",
+    "graduate": "graduate",
+    "werkstudent": "working student", "working student": "working student",
+    "apprentice": "apprentice", "apprenticeship": "apprentice",
+}
+_JOB_KIND_RE = re.compile(r"\b(" + "|".join(sorted(map(re.escape, _JOB_KIND), key=len,
+                                                     reverse=True)) + r")\b")
+
+
+def normalize_title(title: str) -> str:
+    t = fold(title)
+    kinds = sorted({_JOB_KIND[m.group(1)] for m in _JOB_KIND_RE.finditer(t)})
+    t = _JOB_KIND_RE.sub(" ", t)
+    t = re.sub(r"\([^)]*\)", " ", t)             # "(m/w/d)", "(Remote)"
+    t = TITLE_NOISE.sub(" ", t)
+    t = re.sub(r"[^a-z0-9 ]+", " ", t)
+    return " ".join(re.sub(r"\s+", " ", t).split() + kinds)
+
+
+def normalize_company(company: str) -> str:
+    c = re.sub(_COMPANY_SUFFIXES, " ", fold(company))
+    c = re.sub(r"[^a-z0-9 ]+", " ", c)
+    return re.sub(r"\s+", " ", c).strip()
+
+
+# Spellings of one city that should key identically.
+CITY_ALIASES = {
+    "antwerpen": "antwerp", "anvers": "antwerp", "brussel": "brussels",
+    "bruxelles": "brussels", "gent": "ghent", "gand": "ghent", "brugge": "bruges",
+    "luik": "liege", "louvain": "leuven", "ostend": "oostende",
+    "koln": "cologne", "koeln": "cologne", "munchen": "munich", "nurnberg": "nuremberg",
+    "duesseldorf": "dusseldorf", "monchengladbach": "moenchengladbach",
+    "the hague": "den haag", "cracow": "krakow", "warszawa": "warsaw",
+    "gurgaon": "gurugram", "bangalore": "bengaluru", "new delhi": "delhi",
+    "cochin": "kochi", "trivandrum": "thiruvananthapuram", "mysuru": "mysore",
+}
+
+
+def city_key(location: str) -> str:
+    """The known city named in a location string, canonicalised; "" if none is named.
+
+    v1 only knew Dutch, Gulf and Indian cities, so "Hamburg" and "Hamburg, Germany"
+    keyed differently and the fingerprint layer missed every non-NL cross-board copy.
+    """
+    loc = fold(location)
+    if not loc:
+        return ""
+    for city in _city_hints():
+        if re.search(rf"(?<![a-z]){re.escape(city)}(?![a-z])", loc):
+            return CITY_ALIASES.get(city, city)
+    return ""
+
+
+def normalize_city(location: str) -> str:
+    return city_key(location) or re.sub(r"[^a-z ]+", " ", fold(location)).strip()[:40]
+
+
 def fingerprint(company: str, title: str, location: str) -> str:
     key = f"{normalize_company(company)}|{normalize_title(title)}|{normalize_city(location)}"
-    return hashlib.sha1(key.encode("utf-8")).hexdigest()
+    return hashlib.sha1(("v2|" + key).encode("utf-8")).hexdigest()
 
 
 def reject_key(company: str, title: str, location: str) -> str:
@@ -373,6 +450,34 @@ GEO_LOCATION_HINTS = {
               "rajasthan", "madhya pradesh", "andhra pradesh", "odisha", "bihar",
               "jharkhand", "uttarakhand", "goa", "chhattisgarh", "assam"],
 }
+
+
+# Hints that name a country, state or region rather than a city — they place a posting
+# in a geography but say nothing about which office.
+_REGION_HINTS = {
+    "netherlands", "nederland", "holland", "germany", "deutschland", "belgium", "belgie",
+    "belgique", "belgien", "ireland", "eire", "poland", "polska", "tricity", "trojmiasto",
+    "united arab emirates", "uae", "qatar", "saudi", "bahrain", "kuwait", "oman",
+    "india", "ncr", "vlaams-brabant", "oost-vlaanderen", "west-vlaanderen",
+    "antwerpen-provincie", "limburg", "henegouwen", "hainaut", "brabant wallon",
+    "halle-vilvoorde", "maharashtra", "karnataka", "telangana", "tamil nadu", "haryana",
+    "uttar pradesh", "gujarat", "west bengal", "kerala", "punjab", "rajasthan",
+    "madhya pradesh", "andhra pradesh", "odisha", "bihar", "jharkhand", "uttarakhand",
+    "goa", "chhattisgarh", "assam", "ernakulam",
+}
+_CITY_HINTS_CACHE: list[str] = []
+
+
+def _city_hints() -> list[str]:
+    """Every city the geography hints know, longest first ("navi mumbai" before
+    "mumbai"), folded."""
+    if not _CITY_HINTS_CACHE:
+        names = set(CITY_HINTS)
+        for hints in GEO_LOCATION_HINTS.values():
+            names.update(h for h in hints if h not in _REGION_HINTS
+                         and not h.endswith(("skie", "ckie")))      # PL voivodeships
+        _CITY_HINTS_CACHE.extend(sorted({fold(n) for n in names}, key=len, reverse=True))
+    return _CITY_HINTS_CACHE
 
 
 # Location-flexible postings state no usable city, so they get the benefit of the doubt
