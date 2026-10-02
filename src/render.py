@@ -7,15 +7,42 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-# Running order and email chips. Mirrors the `priority` values in config.yaml —
-# permit-route viability, not market size. Rewired 2 Sept 2026 when NL was dropped.
+# Fallback running order and chips, used only when a config carries no geographies.
+# The real values come from `geographies` in config.yaml (see geo_settings), so adding
+# or reordering a country is a config change, not a code one.
 GEO_ORDER = {"nl": 0, "de": 1, "be": 2, "ie": 3, "pl": 4, "uae": 5, "india": 6}
 GEO_LABEL = {"nl": "NL", "de": "Germany", "be": "Belgium", "ie": "Ireland",
              "pl": "Poland", "uae": "Dubai/ME", "india": "India"}
 
-# The digest splits into two top-level sections. NL is the preferred outcome and gets
-# its own block above everything else; the rest are the widened net.
+# The digest splits into two top-level sections: the priority-1 geography gets its own
+# block above everything else; the rest are the widened net.
 PRIORITY_GEO = "nl"
+
+
+def geo_settings(cfg: dict) -> dict:
+    """Running order, chip labels and the priority section, derived from config.
+
+    `priority` orders the geographies; the lowest is the priority section. Optional
+    per-geography keys: `short_label` (chip and subject, e.g. "NL") and
+    `digest_heading` (how the "Beyond ..." heading names it, e.g. "the Netherlands").
+    """
+    geos = sorted(cfg.get("geographies") or [], key=lambda g: g.get("priority", 9))
+    if not geos:
+        return {"order": GEO_ORDER, "labels": GEO_LABEL, "priority": PRIORITY_GEO,
+                "title": "Netherlands", "heading": "the Netherlands", "short": "NL",
+                "others": ""}
+    labels = {g["id"]: g.get("short_label") or g.get("label") or g["id"] for g in geos}
+    top = geos[0]
+    return {
+        "order": {g["id"]: i for i, g in enumerate(geos)},
+        "labels": labels,
+        "priority": top["id"],
+        "title": top.get("label") or top["id"],
+        "heading": top.get("digest_heading") or top.get("label") or top["id"],
+        "short": labels[top["id"]],
+        "others": " · ".join(labels[g["id"]] for g in geos[1:]),
+    }
+
 
 BAD_FLAG_HINTS = ("below", "cannot sponsor", "no visa sponsorship", "vloeiend",
                   "dutch is required", "dutch speaking", "nederlands sprekend",
@@ -58,10 +85,10 @@ def humanize_date(raw: str, today: date | None = None) -> str:
     return ""
 
 
-def _display_key(job: dict):
-    """Within a section, order by permit-route viability: Germany (sec. 18b has no
-    salary floor) before Belgium, then Ireland, Poland, the Gulf and India."""
-    return (GEO_ORDER.get(job.get("geo") or "", 9), -int(job.get("score") or 0))
+def _display_key(job: dict, order: dict | None = None):
+    """Within a section, order by the configured geography priority (permit-route
+    viability), then by score."""
+    return ((order or GEO_ORDER).get(job.get("geo") or "", 99), -int(job.get("score") or 0))
 
 
 def _selection_key(job: dict):
@@ -69,22 +96,24 @@ def _selection_key(job: dict):
 
     Selecting by geography instead meant 20 Dutch slots filled up and a 78-scoring
     Ford customs role in India was cut while 58-scoring NL roles got in. Geography
-    decides the running order, not who is in the room. This still holds after the
-    2 Sept rewire: Germany is priority 1, but a 78-point Polish role beats a 58-point
-    German one into the email.
+    decides the running order, not who is in the room: a 78-point Polish role beats a
+    58-point German one into the email. The one exception is the priority geography's
+    reserved floor of slots, applied in build().
     """
     return -int(job.get("score") or 0)
 
 
-def prepare(jobs: list[dict], today: date | None = None) -> list[dict]:
+def prepare(jobs: list[dict], today: date | None = None, geo: dict | None = None) -> list[dict]:
+    geo = geo or geo_settings({})
     out = []
-    for j in sorted(jobs, key=_display_key):
+    for j in sorted(jobs, key=lambda j: _display_key(j, geo["order"])):
         flags = [{"text": f, "severity": flag_severity(f)} for f in (j.get("flags") or [])]
         # Every geography is chipped now. The old rule skipped the chip for NL because
         # NL was the unstated default; with six countries in play the label always earns
         # its place.
         if j.get("geo"):
-            flags.insert(0, {"text": GEO_LABEL.get(j["geo"], j["geo"]), "severity": "neutral"})
+            flags.insert(0, {"text": geo["labels"].get(j["geo"], j["geo"]),
+                             "severity": "neutral"})
         out.append({**j, "flags": flags, "posted_human": humanize_date(j.get("posted_date", ""), today)})
     return out
 
@@ -96,23 +125,25 @@ def build(scored: list[dict], cfg: dict, meta: dict) -> tuple[str, str, str, lis
     these as sent — scoring above the threshold is not enough, because max_jobs_email
     truncates the list and anything cut must come back tomorrow, not be buried."""
     th = cfg["thresholds"]
+    geo = geo_settings(cfg)
+    priority_geo = geo["priority"]
     eligible = [j for j in scored if int(j.get("score") or 0) >= th["watchlist"]]
 
-    # Pick on merit, then order for reading — with one exception. The Netherlands is
-    # the preferred outcome, so it gets a guaranteed floor of slots rather than having
+    # Pick on merit, then order for reading — with one exception. The priority geography
+    # is the preferred outcome, so it gets a guaranteed floor of slots rather than having
     # to out-score the rest of the world for every place. Everything above that floor
-    # is still won on score alone, which is what stops a 58-point NL role displacing a
+    # is still won on score alone, which is what stops a 58-point priority role displacing a
     # 78-point one (the failure this selection rule was written for in the first place).
     cap = th["max_jobs_email"]
     reserved = min(th.get("min_priority_geo_slots", 0), cap)
     by_score = sorted(eligible, key=_selection_key)
-    selected = [j for j in by_score if j.get("geo") == PRIORITY_GEO][:reserved]
+    selected = [j for j in by_score if j.get("geo") == priority_geo][:reserved]
     picked = {id(j) for j in selected}
     selected += [j for j in by_score if id(j) not in picked][: cap - len(selected)]
     selected = sorted(selected, key=_selection_key)
     run_date = meta.get("run_date") or date.today().isoformat()
     today = datetime.strptime(run_date, "%Y-%m-%d").date()
-    jobs = prepare(selected, today)
+    jobs = prepare(selected, today, geo)
 
     def bands(pool):
         return (
@@ -121,8 +152,8 @@ def build(scored: list[dict], cfg: dict, meta: dict) -> tuple[str, str, str, lis
             [j for j in pool if th["watchlist"] <= j["score"] < th["worth_look"]],
         )
 
-    nl_jobs = [j for j in jobs if j.get("geo") == PRIORITY_GEO]
-    other_jobs = [j for j in jobs if j.get("geo") != PRIORITY_GEO]
+    nl_jobs = [j for j in jobs if j.get("geo") == priority_geo]
+    other_jobs = [j for j in jobs if j.get("geo") != priority_geo]
     nl_apply, nl_worth, nl_watch = bands(nl_jobs)
     other_apply, other_worth, other_watch = bands(other_jobs)
     apply_now, worth_look, watchlist = bands(jobs)
@@ -137,12 +168,16 @@ def build(scored: list[dict], cfg: dict, meta: dict) -> tuple[str, str, str, lis
         "apply_now": apply_now,
         "worth_look": worth_look,
         "watchlist": watchlist,
-        # Two top-level sections: the Netherlands, then everywhere else.
+        # Two top-level sections: the priority geography, then everywhere else.
         "nl_apply": nl_apply, "nl_worth": nl_worth, "nl_watch": nl_watch,
         "nl_total": len(nl_jobs),
         "other_apply": other_apply, "other_worth": other_worth, "other_watch": other_watch,
         "other_total": len(other_jobs),
         "days_to_filing": days_to_filing,
+        "deadline_label": cfg["deadlines"].get("label") or "deadline",
+        "priority_title": geo["title"],
+        "priority_heading": geo["heading"],
+        "others_line": geo["others"],
         "scanned": meta.get("scanned", 0),
         "sources_line": meta.get("sources_line", ""),
         "llm_usage": meta.get("llm_usage", ""),
@@ -171,7 +206,7 @@ def build(scored: list[dict], cfg: dict, meta: dict) -> tuple[str, str, str, lis
         if apply_now:
             bits.append(f"{len(apply_now)} apply-now")
         if not indeed:
-            bits.append(f"NL {ctx['nl_total']} / elsewhere {ctx['other_total']}")
+            bits.append(f"{geo['short']} {ctx['nl_total']} / elsewhere {ctx['other_total']}")
         subject = (f"{prefix}{' — '.join(bits)} · "
                    f"{datetime.strptime(run_date, '%Y-%m-%d').strftime('%a %d %b')}")
 
@@ -184,14 +219,16 @@ def _plaintext(ctx: dict) -> str:
     lines = [f"{ctx['total_new']} new roles — {ctx['run_date_human']}",
              ("Indeed · India only — scored on the same rubric as the daily digest"
               if ctx["channel"] == "indeed" else
-              f"{ctx['days_to_filing']} days to the 15 Sept sponsor-filing deadline"), ""]
+              (f"{ctx['days_to_filing']} days to the {ctx['deadline_label']}"
+               if ctx["days_to_filing"] > 0 else f"The {ctx['deadline_label']} has passed")), ""]
     if ctx["is_test"]:
         lines += ["TEST RUN — nothing marked as sent; these reappear in the first real digest.", ""]
     groups = (
-        ("NETHERLANDS", ctx["nl_total"],
+        (ctx["priority_title"].upper(), ctx["nl_total"],
          (("APPLY NOW", ctx["nl_apply"]), ("WORTH A LOOK", ctx["nl_worth"]),
           ("WATCHLIST", ctx["nl_watch"]))),
-        ("INDIA — VIA INDEED" if ctx["channel"] == "indeed" else "BEYOND THE NETHERLANDS",
+        ("INDIA — VIA INDEED" if ctx["channel"] == "indeed"
+         else f"BEYOND {ctx['priority_heading'].upper()}",
          ctx["other_total"],
          (("APPLY NOW", ctx["other_apply"]), ("WORTH A LOOK", ctx["other_worth"]),
           ("WATCHLIST", ctx["other_watch"]))),
@@ -223,6 +260,4 @@ def _plaintext(ctx: dict) -> str:
         lines.append(f"{ctx['unscored']} could not be scored today and carry into tomorrow")
     for w in ctx.get("warnings") or []:
         lines.append(f"! {w}")
-    lines += [
-              "job_agent · ~/Downloads/10_job_applications/job_agent"]
     return "\n".join(lines)

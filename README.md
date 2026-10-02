@@ -60,6 +60,9 @@ against a spend ledger first so a bug can't blow through a free-tier quota.
   of failure modes hit and fixed during development (a JSON-parsing bug that silently
   turned successful LLM batches into retries, DNS-not-ready-yet failures right after
   wake-from-sleep, Adzuna's per-country title vocabulary not being portable, etc.).
+  Its "When something goes wrong" section covers how a failed or interrupted run
+  recovers without losing or repeating a role, and how failures are surfaced (an
+  alert email, and a run-health footer in the digest).
 
 ## Getting started
 

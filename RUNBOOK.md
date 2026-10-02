@@ -101,6 +101,33 @@ log is `logs/run-<date>.log`. The plist source of truth is `launchd/com.jobagent
 `daily` checks the Gmail credentials **before** collecting, so a run that could not
 deliver costs no Adzuna, LinkedIn or LLM quota — it exits 2 and says why.
 
+## When something goes wrong
+
+The chain is built so that a failure costs a retry, never a lost or repeated role:
+
+- **Sent but not committed.** If a run dies between `send` and `commit`, the next run
+  (any trigger, even the next day) finds the manifest's `sent_message_id`, sees no
+  `gmail:<id>` in `runs`, and finishes the commit — it does not resend.
+- **A broken run never looks like a quiet day.** If no source returned anything, or
+  the scorer answered for none of the candidates, `daily` exits 4 *without sending*,
+  so the next hourly tick retries instead of the already-sent guard locking in a false
+  "No new roles" email. Partial scoring sends, and the footer says how many carry over.
+- **Retries don't re-spend quota.** Collect runs once per day: a retry reuses
+  `<date>_candidates.json` (unless it scanned nothing), and a fully scored file is
+  reused too. `--force` redoes everything.
+- **Failure alert.** Any non-zero exit (or a crash, logged with its traceback) emails
+  the recipients once that day with the log tail. `alerts.enabled: false` turns it off.
+- **Run health in the digest.** Quota caps hit, LinkedIn rate limits or blocked job
+  pages, unparsable LinkedIn cards (markup change), source errors, and an Indeed
+  channel that has gone quiet are listed in the footer.
+- **SMTP.** A partial recipient refusal, or a connection dropped after the server
+  accepted the message, counts as sent.
+- **Bounded work.** Scoring stops at `llm.max_scoring_seconds` and carries the rest;
+  LinkedIn job pages are paced and capped (`sources.linkedin_detail`); jobs that still
+  need a score count inside `max_candidates_per_run`, and carried jobs that already
+  hold a score reuse it instead of being re-scored.
+- **Dates** follow `timezone` in `config.yaml`, not the machine's clock.
+
 ## Daily sequence
 
 ```bash
@@ -146,13 +173,26 @@ recorded as below-threshold and will be re-scored tomorrow. Carry the candidate'
 Three layers in `store.py`, because one posting appears on LinkedIn, Indeed and the
 company's own board on the same morning:
 
-1. canonical URL — tracking params stripped
-2. fingerprint — `sha1(company | title | city)`, all normalised
-3. fuzzy — identical title with one company name containing the other
-   ("Vanderlande" / "Vanderlande Industries"), plus a 0.92 ratio fallback
+1. canonical URL — tracking params stripped (Adzuna's per-request `se=`/`v=` too)
+2. fingerprint — `sha1(company | title | city)`, all normalised. The v2 key folds
+   accents, keys the city for every geography ("Hamburg" == "Hamburg, Germany") and
+   keeps intern / trainee / graduate / working-student in the title, so an internship
+   is never merged into the full-time role. Rows stored under the v1 key are still
+   matched, so nothing already sent resurfaces.
+3. fuzzy — same geography (and same city when both name one), then an identical title
+   with one company name containing the other ("Vanderlande" / "Vanderlande
+   Industries") or a near-miss spelling of a name of 6+ characters, or the same company
+   with a title within the 0.92 ratio. The old blended company+title ratio is gone: it
+   merged "ABB" with "ABC".
 
-Below-threshold jobs are stored with `status='below_threshold'` so they are never
-re-scored. To deliberately resurface something:
+A sent or written-off role that vanishes for longer than `dedup.lookback_days` and is
+then reposted is revived as new. A role still listed is touched every morning, so it
+never qualifies.
+
+Statuses: `new` (queued), `sent`, `below_threshold` (scored under the watchlist, never
+re-scored), `rejected` (a durable prescreen reject — title, seniority or stated years —
+remembered so its page is not fetched again tomorrow), and `expired` (never emailed
+within `thresholds.carry_forward_max_days`). To deliberately resurface something:
 
 ```bash
 sqlite3 state/seen.sqlite "UPDATE jobs SET status='new', sent_on=NULL WHERE company LIKE '%Some Company%';"
@@ -161,7 +201,7 @@ sqlite3 state/seen.sqlite "UPDATE jobs SET status='new', sent_on=NULL WHERE comp
 ## Checks
 
 ```bash
-python3 -m pytest tests/ -q          # 36 tests: dedup, prescreen, spend caps, adapters
+python3 -m pytest tests/ -q          # dedup, prescreen, spend caps, adapters, the daily chain
 python3 src/run.py collect --dry-run # search + report, writes nothing
 python3 src/run.py status            # store stats and recent runs
 ```
@@ -174,9 +214,9 @@ direct proof of the no-duplicates guarantee.
 
 ## Pausing
 
-The scheduled task is `daily-job-scan`. Ask Claude to disable it, or delete
-`~/.claude/scheduled-tasks/daily-job-scan/`. Scheduled tasks only fire while the
-Claude app is open; if it is closed at 07:30 the run happens at next launch.
+`launchctl bootout gui/$(id -u)/com.example.jobagent` stops the daily digest;
+`launchctl bootstrap …` (see "How it runs now") starts it again. The Indeed channel's
+discovery is the Claude desktop task `indeed-india-daily` — disable it there.
 
 ## Notes from setup
 
@@ -230,9 +270,9 @@ Claude app is open; if it is closed at 07:30 the run happens at next launch.
   decompose under NFKD, so it is translated explicitly.
 - The IND register is one inline HTML table of ~12.9k rows with the organisation
   name in a `<th>`, not a downloadable file. A failed fetch yields "sponsor status
-  unknown" and never scores a job down. **It is no longer fetched**: the lookup is
-  gated on a geography declaring `visa_mode: ind_sponsor`, and none does since NL was
-  dropped. The code stays live for the day a register-backed geography returns.
+  unknown" and never scores a job down. It is fetched only because a geography (the
+  Netherlands) declares `visa_mode: ind_sponsor`, and is cached for
+  `ind_register.refresh_days`; remove that visa_mode and the lookup is skipped.
 - **Salary floors are per-geography** (`salary_floor_month` in `config.yaml`), merged
   into the prescreen rules by `run.py` before `prescore.screen()`. Belgium 3,260.80
   (Flanders under-30) and Ireland 3,050.42 (GEP) bind; **Germany deliberately has

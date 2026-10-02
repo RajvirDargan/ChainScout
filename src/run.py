@@ -329,9 +329,9 @@ def stage_collect(args) -> int:
         log(line)
 
     # ---- IND recognised-sponsor register (best effort).
-    # Only fetched if some geography actually declares visa_mode: ind_sponsor. After the
-    # Netherlands was dropped nothing does, so this skips a ~12.9k-row HTML table parse
-    # on every run. The code stays live for the day NL (or another register) comes back.
+    # Only fetched if some geography declares visa_mode: ind_sponsor (the Netherlands
+    # does), and then only every ind_register.refresh_days — otherwise the cached CSV
+    # is reused, so the ~12.9k-row HTML table is not parsed on every run.
     ind_cache = STATE / "ind_sponsors.csv"
     ind_index = None
     if "ind_sponsor" in set(geo_visa_mode.values()):

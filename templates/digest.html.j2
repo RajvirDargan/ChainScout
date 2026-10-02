@@ -10,8 +10,8 @@
       {%- if apply_now|length %} · <strong>{{ apply_now|length }} worth applying to now</strong>{% endif %}</div>
     <div style="font-size:13px;margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.22);">
       {% if channel == 'indeed' %}<strong>Indeed · India only</strong> — scored on the same rubric as the daily digest; Delhi NCR first, then Mumbai
-      {% elif days_to_filing > 0 %}<strong>{{ days_to_filing }} days</strong> until the 15 Sept sponsor-filing deadline
-      {% else %}Filing deadline has passed — see VISA_briefing.md for the leniency window{% endif %}
+      {% elif days_to_filing > 0 %}<strong>{{ days_to_filing }} days</strong> until the {{ deadline_label }}
+      {% else %}The {{ deadline_label }} has passed{% endif %}
     </div>
   </div>
 
@@ -72,7 +72,7 @@
   {% endmacro %}
 
   {% if nl_total %}
-  {{ group_heading('Netherlands', nl_total, 'First priority — the preferred outcome, and the only roles that can still affect the 15 Sept filing deadline.') }}
+  {{ group_heading(priority_title, nl_total, 'First priority — the preferred outcome.') }}
   {{ section('Apply now', nl_apply, '#1c6b2e', 'Strong fit and the visa maths works.') }}
   {{ section('Worth a look', nl_worth, '#b8860b', 'Good fit with a caveat — read the flags.') }}
   {% if nl_watch|length %}
@@ -84,7 +84,7 @@
   {% if channel == 'indeed' %}
   {{ group_heading('India — via Indeed', other_total, 'New Indeed postings not already sent in the daily digest. Delhi NCR scores highest, then Mumbai.') }}
   {% else %}
-  {{ group_heading('Beyond the Netherlands', other_total, 'Germany · Belgium · Ireland · Poland · Dubai/ME · India — ordered by how viable the work permit is for you.') }}
+  {{ group_heading('Beyond ' ~ priority_heading, other_total, others_line ~ ' — ordered by how viable the work permit is for you.') }}
   {% endif %}
   {{ section('Apply now', other_apply, '#1c6b2e', 'Strong fit and the visa maths works.') }}
   {{ section('Worth a look', other_worth, '#b8860b', 'Good fit with a caveat — read the flags.') }}
@@ -117,8 +117,7 @@
     {% if llm_usage %}Scored by {{ llm_usage }}.<br>{% endif %}
     {% for w in warnings %}<span style="color:#8a1c1c;">&#9888; {{ w }}</span><br>{% endfor %}
     {% if unscored %}<strong style="color:#8a1c1c;">{{ unscored }} could not be scored today</strong> and carry into tomorrow.<br>{% endif %}
-    Scored against your_cv.pdf. Nothing here repeats a role from an earlier digest.<br>
-    job_agent · ~/Downloads/10_job_applications/job_agent
+    Scored against PROFILE.md. Nothing here repeats a role from an earlier digest.
   </div>
 </div>
 </body>

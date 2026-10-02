@@ -58,6 +58,7 @@ deadlines:
   # negative. See render.py.
   sponsor_filing: 2026-12-31
   permit_expiry: 2026-12-31
+  label: sponsor-filing deadline   # how the countdown names sponsor_filing
 
 # ------------------------------------------------------------------------- LLM
 # Scoring and the extraction fallback both run through here. The Antigravity CLI is
@@ -227,6 +228,8 @@ geographies:
 
   - id: nl
     label: Netherlands
+    short_label: NL                  # email chip and subject line
+    digest_heading: the Netherlands  # "Beyond the Netherlands" section heading
     priority: 1              # TOP PRIORITY — gets the full adzuna.titles list
     firecrawl_location: Netherlands
     # Restricting to these collapsed every result to LinkedIn and lost direct
@@ -355,6 +358,7 @@ geographies:
 
   - id: uae
     label: Dubai / Middle East
+    short_label: Dubai/ME
     priority: 6
     firecrawl_location: United Arab Emirates
     linkedin_location: United Arab Emirates

@@ -8,7 +8,7 @@ can run two differently-tuned digests without duplicating the whole rubric.
 
 - **Every job here is in India.** If the candidate is a national resident in a base
   city there, no relocation or work permit is needed — score visa viability per the
-  existing "Dubai & India" row.
+  existing "Dubai & home region" row.
 - **Location (10 pts), replacing the India line in §5:** Delhi NCR (Gurugram/Gurgaon,
   Delhi, Noida, Faridabad, Ghaziabad, Manesar) 9–10 · Mumbai / Navi Mumbai / Thane 7–8
   · remote within India 7 · any other Indian city 4–6. Adjust the metro-area scoring
