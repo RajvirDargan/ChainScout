@@ -165,17 +165,32 @@ class Store:
         )
         self.conn.commit()
 
-    def record_run(self, run_date: str, collected: int, new_jobs: int, sent: int, notes: str = ""):
+    def record_run(self, run_date: str, collected: int | None, new_jobs: int | None,
+                   sent: int | None, notes: str = ""):
+        """Upsert the run row. A None (or empty notes) leaves the stored value alone.
+
+        collect and commit both write this row. Overwriting blindly let a later stage
+        zero the other's figures, and let a re-run collect wipe the `gmail:<id>` note
+        that proves a day was committed.
+        """
         self.conn.execute(
             """INSERT INTO runs (run_date, started_at, collected, new_jobs, sent, notes)
                VALUES (?,?,?,?,?,?)
                ON CONFLICT(run_date) DO UPDATE SET
-                 collected=excluded.collected, new_jobs=excluded.new_jobs,
-                 sent=excluded.sent, notes=excluded.notes""",
+                 collected=COALESCE(excluded.collected, runs.collected),
+                 new_jobs=COALESCE(excluded.new_jobs, runs.new_jobs),
+                 sent=COALESCE(excluded.sent, runs.sent),
+                 notes=COALESCE(NULLIF(excluded.notes, ''), runs.notes)""",
             (run_date, datetime.now(timezone.utc).isoformat(timespec="seconds"),
              collected, new_jobs, sent, notes),
         )
         self.conn.commit()
+
+    def committed(self, run_key: str) -> bool:
+        """True once `commit` has recorded the Gmail message id for this run."""
+        row = self.conn.execute(
+            "SELECT notes FROM runs WHERE run_date = ?", (run_key,)).fetchone()
+        return bool(row and (row["notes"] or "").startswith("gmail:"))
 
     # ------------------------------------------------------------------ reports
 

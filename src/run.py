@@ -431,7 +431,7 @@ def stage_collect(args) -> int:
             "sources_line": ", ".join(f"{k} {v}" for k, v in per_source.items() if v),
             "candidates": candidates,
         }, indent=2, ensure_ascii=False))
-        store.record_run(run_date, len(raw_hits), len(candidates), 0)
+        store.record_run(run_date, len(raw_hits), len(candidates), None)
         log(f"  wrote {out}")
 
     store.close()
@@ -460,6 +460,7 @@ def stage_render(args) -> int:
         meta["sources_line"] = cand.get("sources_line", "")
     # Which model actually scored today, so a backend fallback is visible in the digest.
     meta["llm_usage"] = payload.get("llm_usage", "") if isinstance(payload, dict) else ""
+    meta["unscored"] = int(payload.get("unscored_count") or 0) if isinstance(payload, dict) else 0
 
     subject, html, text, rendered_fps = render.build(scored, cfg, meta)
 
@@ -532,7 +533,7 @@ def stage_commit(args) -> int:
 
     store.mark_sent(emailed, run_date)
     store.mark_below_threshold(below)
-    store.record_run(run_key(run_date, args), 0, len(everything), len(emailed),
+    store.record_run(run_key(run_date, args), None, len(everything), len(emailed),
                      notes=f"gmail:{args.message_id}")
     stats = store.stats()
     store.close()
@@ -564,7 +565,7 @@ def stage_score(args) -> int:
     if not candidates:
         log("  nothing to score")
         (outbox_for(args) / f"{run_date}_scored.json").write_text(
-            json.dumps({"run_date": run_date, "jobs": []}, indent=2))
+            json.dumps({"run_date": run_date, "jobs": [], "unscored_count": 0}, indent=2))
         return 0
 
     profile = (ROOT / "PROFILE.md").read_text()
@@ -604,7 +605,10 @@ def stage_score(args) -> int:
         return 0
 
     (outbox_for(args) / f"{run_date}_scored.json").write_text(json.dumps(
-        {"run_date": run_date, "llm_usage": chain.summary(), "jobs": scored},
+        # unscored_count lets `daily` tell "nothing cleared the bar" apart from "the
+        # scorer was down" — the second must never go out as a "No new roles" email.
+        {"run_date": run_date, "llm_usage": chain.summary(), "jobs": scored,
+         "unscored_count": len(unscored)},
         indent=2, ensure_ascii=False))
     log(f"  wrote {outbox_for(args) / f'{run_date}_scored.json'}")
     store.close()
@@ -697,6 +701,81 @@ def wait_for_network(log: "Logger", host: str, timeout: int, interval: int) -> b
         time.sleep(interval)
 
 
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except (ValueError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _ns(**kw) -> argparse.Namespace:
+    """Stage arguments for the chained runs, so each stage sees what its CLI would give."""
+    return argparse.Namespace(**kw)
+
+
+def _is_committed(key: str) -> bool:
+    store = Store(STATE / "seen.sqlite")
+    try:
+        return store.committed(key)
+    finally:
+        store.close()
+
+
+def recover_uncommitted(log: "Logger", channel: str = "main", days: int = 7) -> int:
+    """Commit any recent digest that went out but never got its commit.
+
+    `send` writes the Message-ID into the manifest and `commit` then marks the jobs as
+    sent. A run killed between the two (the Mac sleeping, a crash) used to leave that
+    day permanently half-done: the already-sent guard saw the Message-ID and no-oped,
+    nothing was ever marked sent, and every one of those roles went out AGAIN in the
+    next digest. Commit is idempotent, so finishing it late is always safe.
+    """
+    ob = OUTBOX / "indeed" if channel == "indeed" else OUTBOX
+    pending = []
+    for path in sorted(ob.glob("*_email.json"))[-days:]:
+        run_date = path.name.split("_", 1)[0]
+        message_id = _read_json(path).get("sent_message_id")
+        key = run_date if channel == "main" else f"{run_date}#{channel}"
+        if message_id and not _is_committed(key):
+            pending.append((run_date, message_id))
+    for run_date, message_id in pending:
+        log(f"  ! the {run_date} digest was sent ({message_id}) but never committed "
+            f"— committing it now so those roles are not emailed again")
+        rc = stage_commit(_ns(date=run_date, channel=channel, message_id=message_id))
+        if rc != 0:
+            log(f"  ! late commit for {run_date} failed (rc={rc})")
+            return rc
+    return 0
+
+
+def digest_health(outbox: Path, run_date: str, check_scanned: bool = True) -> str | None:
+    """Why today's digest must NOT be sent, or None if it is fit to send.
+
+    A digest that says "No new roles" is a claim about the job market. When the real
+    cause is that every source was unreachable, or the scorer was down, sending it
+    would both mislead and — through the already-sent guard — block any retry for the
+    rest of the day. Refusing instead leaves the next hourly tick to try again.
+    """
+    cand = _read_json(outbox / f"{run_date}_candidates.json")
+    scored = _read_json(outbox / f"{run_date}_scored.json")
+    if check_scanned and cand and not cand.get("scanned"):
+        return ("no postings came back from any source (network down, or every source "
+                "failing) — not sending a misleading 'No new roles' digest")
+    unscored = int(scored.get("unscored_count") or 0)
+    if unscored and not scored.get("jobs"):
+        return (f"scoring failed for all {unscored} candidate(s) — the LLM chain is down; "
+                f"not sending a misleading 'No new roles' digest")
+    return None
+
+
+def _fresh(path: Path, than: Path) -> bool:
+    try:
+        return path.stat().st_mtime >= than.stat().st_mtime
+    except OSError:
+        return False
+
+
 def stage_daily(args) -> int:
     """collect -> score -> render -> send -> commit. What launchd invokes.
 
@@ -707,17 +786,15 @@ def stage_daily(args) -> int:
     cfg_all = load_config()
     sched = cfg_all.get("schedule", {}) or {}
 
-    # --- Guard 1: already delivered today. Makes the whole run idempotent, which is
-    # what lets several triggers (07:30, login, hourly catch-up) share one entry point
-    # without ever sending twice.
+    # --- Guard 1: already delivered AND committed today. Makes the whole run
+    # idempotent, which is what lets several triggers (07:30, login, hourly catch-up)
+    # share one entry point without ever sending twice. Sent-but-uncommitted falls
+    # through so the commit can be finished under the lock.
     email_path = OUTBOX / f"{run_date}_email.json"
-    if email_path.exists() and not args.force:
-        try:
-            if json.loads(email_path.read_text()).get("sent_message_id"):
-                print(f"digest for {run_date} already sent — nothing to do")
-                return 0
-        except (ValueError, OSError):
-            pass
+    if (not args.force and _read_json(email_path).get("sent_message_id")
+            and _is_committed(run_date)):
+        print(f"digest for {run_date} already sent — nothing to do")
+        return 0
 
     # --- Guard 2: too early. A catch-up tick at 03:00 should wait, not deliver a
     # digest in the middle of the night.
@@ -750,6 +827,14 @@ def _daily_stages(args, run_date: str) -> int:
     log = Logger(LOGS / f"run-{run_date}.log")
     log(f"########## daily run {run_date}")
 
+    rc = recover_uncommitted(log, "main")
+    if rc != 0:
+        return rc
+    email_path = OUTBOX / f"{run_date}_email.json"
+    if not args.force and _read_json(email_path).get("sent_message_id"):
+        log("  today's digest was already sent — nothing more to do")
+        return 0
+
     net_cfg = (load_config().get("network", {}) or {})
     wait_for_network(
         log,
@@ -766,41 +851,54 @@ def _daily_stages(args, run_date: str) -> int:
         log(f"! cannot send, so not starting: {exc}")
         return 2
 
-    class A:
-        pass
+    cand_path = OUTBOX / f"{run_date}_candidates.json"
+    scored_path = OUTBOX / f"{run_date}_scored.json"
 
-    for name, stage, extra in (
-        ("collect", stage_collect, {"dry_run": False, "weekly": False,
-                                    "limit_queries": 0}),
-        ("score", stage_score, {"dry_run": False, "limit": 0}),
-        ("render", stage_render, {"scored": None, "test": False}),
-    ):
-        a = A()
-        a.date = run_date
-        for k, v in extra.items():
-            setattr(a, k, v)
-        rc = stage(a)
+    # Collect at most once a day. A retry after a failed send or a failed scoring pass
+    # used to re-run the whole collect, re-spending the daily Adzuna/LinkedIn budget
+    # that the first attempt had already used up — so each retry built its digest
+    # from less. A collect that reached nothing at all (scanned 0) is retried.
+    if not args.force and _read_json(cand_path).get("scanned"):
+        log(f"  collect: reusing today's {cand_path.name}")
+    else:
+        rc = stage_collect(_ns(date=run_date, dry_run=False, weekly=False, limit_queries=0))
         if rc != 0:
-            log(f"! {name} failed (rc={rc}) — stopping before send; nothing committed")
+            log(f"! collect failed (rc={rc}) — stopping before send; nothing committed")
             return rc
 
-    a = A()
-    a.date = run_date
-    rc = stage_send(a)
+    # Likewise a scored file that covers every candidate is reused rather than paid for
+    # again. A partial one is redone: the unscored jobs deserve another attempt.
+    scored = _read_json(scored_path)
+    if (not args.force and scored and not scored.get("unscored_count")
+            and _fresh(scored_path, cand_path)):
+        log(f"  score: reusing today's {scored_path.name}")
+    else:
+        rc = stage_score(_ns(date=run_date, channel="main", dry_run=False, limit=0))
+        if rc != 0:
+            log(f"! score failed (rc={rc}) — stopping before send; nothing committed")
+            return rc
+
+    problem = digest_health(OUTBOX, run_date)
+    if problem:
+        log(f"! {problem}. Nothing sent, nothing committed; the next run retries.")
+        return 4
+
+    rc = stage_render(_ns(date=run_date, channel="main", scored=None, test=False))
+    if rc != 0:
+        log(f"! render failed (rc={rc}) — stopping before send; nothing committed")
+        return rc
+
+    rc = stage_send(_ns(date=run_date, channel="main"))
     if rc != 0:
         log("! send failed — nothing committed, roles carry into tomorrow")
         return rc
 
-    manifest = json.loads((OUTBOX / f"{run_date}_email.json").read_text())
-    message_id = manifest.get("sent_message_id")
+    message_id = _read_json(email_path).get("sent_message_id")
     if not message_id:
         log("! send reported success but wrote no Message-ID — refusing to commit")
         return 3
 
-    a = A()
-    a.date = run_date
-    a.message_id = message_id
-    rc = stage_commit(a)
+    rc = stage_commit(_ns(date=run_date, channel="main", message_id=message_id))
     log("########## daily run complete" if rc == 0 else "! commit failed")
     return rc
 
@@ -942,43 +1040,49 @@ def stage_indeed_daily(args) -> int:
     args.channel = "indeed"
     ob = outbox_for(args)
     email_path = ob / f"{run_date}_email.json"
-    if email_path.exists() and not args.force:
-        try:
-            if json.loads(email_path.read_text()).get("sent_message_id"):
-                print(f"indeed digest for {run_date} already sent — nothing to do")
-                return 0
-        except (ValueError, OSError):
-            pass
-    if not (ob / f"{run_date}_candidates.json").exists():
-        print("no indeed candidates for today — run indeed-ingest first")
-        return 1
+    if (not args.force and _read_json(email_path).get("sent_message_id")
+            and _is_committed(run_key(run_date, args))):
+        print(f"indeed digest for {run_date} already sent — nothing to do")
+        return 0
 
     lock = STATE / "indeed.lock"
     holder = lock_holder(lock)
     if holder is not None:
         print(f"an indeed run is already in progress (pid {holder})")
         return 0
+    lock.parent.mkdir(parents=True, exist_ok=True)
     lock.write_text(str(os.getpid()))
     log = log_for(run_date, args)
     try:
+        rc = recover_uncommitted(log, "indeed")
+        if rc != 0:
+            return rc
+        if not args.force and _read_json(email_path).get("sent_message_id"):
+            log("  today's indeed digest was already sent — nothing more to do")
+            return 0
+        if not (ob / f"{run_date}_candidates.json").exists():
+            log("! no indeed candidates for today — run indeed-ingest first")
+            return 1
         try:
             mailer_src.credentials(fetch.load_env(ROOT / ".env"))
         except mailer_src.MailerError as exc:
             log(f"! cannot send, so not starting: {exc}")
             return 2
 
-        class A:
-            pass
-
         def mk(**kw):
-            a = A()
-            a.date, a.channel = run_date, "indeed"
-            for k, v in kw.items():
-                setattr(a, k, v)
-            return a
+            return _ns(date=run_date, channel="indeed", **kw)
 
+        rc = stage_score(mk(dry_run=False, limit=0))
+        if rc != 0:
+            log(f"! score failed (rc={rc}) — nothing committed")
+            return rc
+        # Indeed discovery happens outside this process, so an empty scan is not a
+        # failure signal here — only a scorer that answered for nobody is.
+        problem = digest_health(ob, run_date, check_scanned=False)
+        if problem:
+            log(f"! {problem}. Nothing sent, nothing committed.")
+            return 4
         for name, stage, a in (
-            ("score", stage_score, mk(dry_run=False, limit=0)),
             ("render", stage_render, mk(scored=None, test=False)),
             ("send", stage_send, mk()),
         ):
@@ -986,7 +1090,7 @@ def stage_indeed_daily(args) -> int:
             if rc != 0:
                 log(f"! {name} failed (rc={rc}) — nothing committed")
                 return rc
-        message_id = json.loads(email_path.read_text()).get("sent_message_id")
+        message_id = _read_json(email_path).get("sent_message_id")
         if not message_id:
             log("! send reported success but wrote no Message-ID — refusing to commit")
             return 3

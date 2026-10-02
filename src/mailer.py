@@ -55,22 +55,41 @@ def send(env: dict, recipients: list[str], subject: str, text_body: str,
     sender, password = credentials(env)
     msg = build_message(sender, recipients, subject, text_body, html_body)
 
+    # `accepted` flips once the server has taken the message. Anything that fails
+    # after that point (a dropped connection on QUIT, say) must NOT be reported as a
+    # failed send: the email went out, and treating it as unsent means no commit and
+    # the same roles going out again on the next run.
+    accepted = False
+    refused: dict = {}
     try:
         context = ssl.create_default_context()
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as smtp:
+        smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60)
+        try:
             smtp.ehlo()
             smtp.starttls(context=context)
             smtp.ehlo()
             smtp.login(sender, password)
-            refused = smtp.send_message(msg)
-        if refused:
-            raise MailerError(f"server refused some recipients: {refused}")
+            # Raises SMTPRecipientsRefused only when EVERY recipient is refused; a
+            # partial refusal comes back as a dict and the rest were delivered.
+            refused = smtp.send_message(msg) or {}
+            accepted = True
+        finally:
+            try:
+                smtp.quit()
+            except (smtplib.SMTPException, OSError):
+                pass
     except smtplib.SMTPAuthenticationError as exc:
         raise MailerError(
             "Gmail rejected the credentials. An app password is required — a normal "
             f"account password will not work here. ({exc.smtp_code})") from exc
     except (smtplib.SMTPException, OSError) as exc:
-        raise MailerError(f"SMTP send failed: {type(exc).__name__}: {exc}") from exc
+        if not accepted:
+            raise MailerError(f"SMTP send failed: {type(exc).__name__}: {exc}") from exc
+        log(f"  ! SMTP error after the message was accepted ({type(exc).__name__}) — "
+            "treating it as sent")
 
-    log(f"  sent to {', '.join(recipients)}")
+    if refused:
+        log(f"  ! server refused some recipients, delivered to the rest: {refused}")
+    delivered = [r for r in recipients if r not in refused]
+    log(f"  sent to {', '.join(delivered)}")
     return msg["Message-ID"]

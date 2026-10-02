@@ -144,6 +144,7 @@ def build(scored: list[dict], cfg: dict, meta: dict) -> tuple[str, str, str, lis
         "scanned": meta.get("scanned", 0),
         "sources_line": meta.get("sources_line", ""),
         "llm_usage": meta.get("llm_usage", ""),
+        "unscored": meta.get("unscored", 0),
         "watchlist_threshold": th["watchlist"],
         "is_test": meta.get("is_test", False),
         "channel": meta.get("channel") or "main",
@@ -215,6 +216,8 @@ def _plaintext(ctx: dict) -> str:
     lines += ["", f"{ctx['scanned']} scanned · {ctx['sources_line']}"]
     if ctx.get("llm_usage"):
         lines.append(f"scored by {ctx['llm_usage']}")
+    if ctx.get("unscored"):
+        lines.append(f"{ctx['unscored']} could not be scored today and carry into tomorrow")
     lines += [
               "job_agent · ~/Downloads/10_job_applications/job_agent"]
     return "\n".join(lines)
