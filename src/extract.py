@@ -13,6 +13,8 @@ fetch itself never needed a paid service — only the parsing did.
 from __future__ import annotations
 
 import re
+import time
+from urllib.parse import urlparse
 
 import requests
 
@@ -32,6 +34,68 @@ def fetch_html(url: str, timeout: int = 25) -> str:
         return r.text if r.ok else ""
     except requests.RequestException:
         return ""
+
+
+class PageFetcher:
+    """Job-page fetches, with LinkedIn treated as the rate-limited service it is.
+
+    The LinkedIn search calls were paced and metered, but the detail page behind every
+    card was fetched flat out — hundreds of unpaced requests a morning, which is the
+    likelier way to get blocked. LinkedIn pages are now spaced `delay` seconds apart,
+    reserved against the `linkedin_detail` ledger when it is configured, and a 429 or
+    a redirect to the sign-in wall stops LinkedIn fetches for the rest of the run.
+    A blocked fetch returns "" so the posting is retried tomorrow, rather than its
+    sign-in page being stored as the job description.
+    """
+
+    LEDGER = "linkedin_detail"
+
+    def __init__(self, quota=None, log=print, delay: float = 1.5, session=None):
+        self.quota = quota
+        self.log = log
+        self.delay = delay
+        self.session = session or requests.Session()
+        self.session.headers.update(HEADERS)
+        self.blocked = False
+        self._last_linkedin = 0.0
+        self.linkedin_fetches = 0
+
+    @staticmethod
+    def is_linkedin(url: str) -> bool:
+        host = urlparse(url).netloc.lower()
+        return host == "linkedin.com" or host.endswith(".linkedin.com")
+
+    def _metered(self) -> bool:
+        return self.quota is not None and bool(self.quota.limits(self.LEDGER))
+
+    def get(self, url: str, timeout: int = 25) -> str:
+        linkedin = self.is_linkedin(url)
+        if linkedin:
+            if self.blocked:
+                return ""
+            if self._metered() and not self.quota.check_and_reserve(self.LEDGER, 1):
+                return ""
+            wait = self.delay - (time.monotonic() - self._last_linkedin)
+            if wait > 0:
+                time.sleep(wait)
+        try:
+            r = self.session.get(url, timeout=timeout)
+        except requests.RequestException:
+            if linkedin and self._metered():
+                self.quota.refund(self.LEDGER, 1)
+            return ""
+        finally:
+            if linkedin:
+                self._last_linkedin = time.monotonic()
+        if linkedin:
+            self.linkedin_fetches += 1
+            if r.status_code in (429, 999) or "authwall" in (r.url or "") \
+                    or "/login" in urlparse(r.url or "").path:
+                self.blocked = True
+                self.log(f"    ! linkedin blocked detail pages (HTTP {r.status_code}) — "
+                         f"no more LinkedIn page fetches this run")
+                return ""
+        return r.text if r.ok else ""
 
 
 def html_to_text(html: str) -> str:
@@ -57,14 +121,19 @@ def html_to_text(html: str) -> str:
     return re.sub(r"\n\s*\n\s*\n+", "\n\n", text).strip()
 
 
-def enrich(job: dict, gemini=None, min_chars: int = 300, log=print) -> tuple[dict, str]:
+def enrich(job: dict, gemini=None, min_chars: int = 300, log=print,
+           fetcher: PageFetcher | None = None) -> tuple[dict, str]:
     """Fill in job['body'] and any missing fields. Returns (job, method_used)."""
     url = job.get("url") or job.get("canonical_url") or ""
     if not url:
         return job, "no_url"
 
-    html = fetch_html(url)
+    if fetcher is not None and fetcher.blocked and fetcher.is_linkedin(url):
+        return job, "linkedin_blocked"
+    html = fetcher.get(url) if fetcher is not None else fetch_html(url)
     if not html:
+        if fetcher is not None and fetcher.blocked and fetcher.is_linkedin(url):
+            return job, "linkedin_blocked"
         return job, "fetch_failed"
 
     # --- 1. JSON-LD: free and exact.

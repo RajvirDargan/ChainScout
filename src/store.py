@@ -90,7 +90,7 @@ class Store:
         if not needle.strip():
             return None
         rows = self.conn.execute(
-            "SELECT * FROM jobs WHERE last_seen >= ?", (cutoff,)
+            "SELECT * FROM jobs WHERE last_seen >= ? AND status != ?", (cutoff, STATUS_REJECTED)
         ).fetchall()
         my_co, my_title = nz.normalize_company(company), nz.normalize_title(title)
         for row in rows:
@@ -109,9 +109,15 @@ class Store:
         return None
 
     def is_known(self, job: dict, ratio: float = 0.92, lookback_days: int = 90):
-        """Return the existing row if we've seen this job before, else None."""
+        """Return the existing row if we've seen this job before, else None.
+
+        A prescreen reject is only ever matched as itself (same URL, or same company,
+        exact title and city) — never through the fingerprint or the fuzzy layer, which
+        normalise seniority away and would let a rejected senior role hide a junior one.
+        """
         return (
             self._by_url(job["canonical_url"])
+            or self._by_fingerprint(nz.reject_key(job["company"], job["title"], job["location"]))
             or self._by_fingerprint(nz.fingerprint(job["company"], job["title"], job["location"]))
             or self._fuzzy_match(job["company"], job["title"], ratio, lookback_days)
         )
@@ -140,6 +146,29 @@ class Store:
         )
         self.conn.commit()
         return fp
+
+    def insert_rejected(self, job: dict, reason: str) -> str:
+        """Remember a prescreen reject, so tomorrow it is 'already known' before its page
+        is fetched again. Returns its key.
+
+        Resurface rejects after loosening a rule with
+        `UPDATE jobs SET status='new' WHERE status='rejected'` — the next collect
+        re-screens every carried job against the current rules.
+        """
+        key = nz.reject_key(job["company"], job["title"], job["location"])
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.conn.execute(
+            """INSERT OR IGNORE INTO jobs
+               (fingerprint, canonical_url, url, company, title, location, source, geo,
+                salary_text, posted_date, body, rationale, first_seen, last_seen, status)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (key, job["canonical_url"], job["url"], job["company"], job["title"],
+             job["location"], job["source"], job.get("geo"), job.get("salary_text", ""),
+             job.get("posted_date", ""), (job.get("body") or "")[:12000],
+             f"prescreen: {reason}", now, now, STATUS_REJECTED),
+        )
+        self.conn.commit()
+        return key
 
     def record_score(self, fp: str, score: int, rationale: str, flags: str):
         self.conn.execute(

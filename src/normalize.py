@@ -94,6 +94,10 @@ def canonical_url(url: str) -> str:
     netloc = p.netloc.lower()
     if netloc.startswith("www."):
         netloc = netloc[4:]
+    # Adzuna redirect links carry per-request session params (se=, v=) alongside the
+    # ad id in the path, so the same posting came back under a new URL every day.
+    if netloc.startswith("adzuna.") and "/land/ad/" in path:
+        kept = []
     return urlunparse((p.scheme or "https", netloc, path, "", urlencode(sorted(kept)), ""))
 
 
@@ -125,6 +129,19 @@ def normalize_city(location: str) -> str:
 def fingerprint(company: str, title: str, location: str) -> str:
     key = f"{normalize_company(company)}|{normalize_title(title)}|{normalize_city(location)}"
     return hashlib.sha1(key.encode("utf-8")).hexdigest()
+
+
+def reject_key(company: str, title: str, location: str) -> str:
+    """Store key for a prescreen reject.
+
+    Kept apart from `fingerprint` on purpose. The fingerprint normalises seniority
+    words away ("Senior Logistics Analyst" == "Logistics Analyst"), so keying a
+    rejected senior role by it would suppress the junior role at the same company.
+    This key uses the title as written.
+    """
+    raw_title = re.sub(r"\s+", " ", fold(title)).strip()
+    key = f"{normalize_company(company)}|{raw_title}|{normalize_city(location)}"
+    return "rej:" + hashlib.sha1(key.encode("utf-8")).hexdigest()
 
 
 def looks_like_index(url: str, title: str = "") -> bool:

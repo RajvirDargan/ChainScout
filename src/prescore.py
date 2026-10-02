@@ -141,19 +141,39 @@ def seniority_reject(title: str, rules: dict) -> str | None:
     return None
 
 
+def title_reject(title: str, rules: dict) -> str | None:
+    """The title-only half of the screen. Returns a reject reason, or None to keep.
+
+    Split out so collect can run it BEFORE fetching a posting's page: a title that
+    rules a job out needs no description, and fetching one anyway was a page load (and
+    often a Gemini call) spent on every senior/manager posting, every single day.
+    """
+    t = (title or "").lower()
+    for term in rules.get("reject_title_terms", []):
+        if term in t:
+            return f"title_term:{term.strip()}"
+    return seniority_reject(t, rules)
+
+
+# Rejects that follow from the posting itself and will not change on a second look.
+# body_too_short is deliberately NOT here: it is as often a failed or blocked page
+# fetch as a genuinely empty posting, and must get another chance tomorrow.
+DURABLE_REJECTS = ("title_term:", "seniority:", "requires_")
+
+
+def is_durable(reason: str) -> bool:
+    return (reason or "").startswith(DURABLE_REJECTS)
+
+
 def screen(job: dict, rules: dict) -> tuple[bool, str, list[str]]:
     """Returns (keep, reject_reason, flags)."""
     title = (job.get("title") or "").lower()
     body = (job.get("body") or "").lower()
     flags: list[str] = []
 
-    for term in rules.get("reject_title_terms", []):
-        if term in title:
-            return False, f"title_term:{term.strip()}", flags
-
-    senior = seniority_reject(title, rules)
-    if senior:
-        return False, senior, flags
+    reason = title_reject(title, rules)
+    if reason:
+        return False, reason, flags
 
     if len(body) < rules.get("min_body_chars", 300):
         return False, "body_too_short", flags
@@ -166,6 +186,11 @@ def screen(job: dict, rules: dict) -> tuple[bool, str, list[str]]:
     # reject, not a flag — they cannot apply to it, so it should never reach the digest.
     ceiling = int(rules.get("max_years_experience", 3))
     yrs = max_years_required(body) or max_years_required(job.get("title") or "")
+    # The extraction model reads a stated requirement the regex can miss ("a minimum
+    # of five years"); take whichever is higher.
+    extracted = job.get("years_required")
+    if isinstance(extracted, int) and 0 < extracted <= 25:
+        yrs = max(yrs or 0, extracted)
     if yrs is not None:
         if yrs > ceiling:
             return False, f"requires_{yrs}_years", flags

@@ -205,9 +205,6 @@ def stage_collect(args) -> int:
                 f"{len(recs)} results, {kept} kept")
         log(f"  Adzuna calls used: {adz.calls_used}")
 
-    # ---- Fill in bodies the sources left thin: bol.com stubs its description to
-    # "<p>x</p>", and Adzuna truncates. Free fetch + JSON-LD first, Gemini only for
-    # pages that carry no JSON-LD. This used to be a paid Firecrawl scrape.
     # ---- LinkedIn guest search: the only free source that reaches the Gulf.
     if quota.enabled("linkedin"):
         lqueries = linkedin_src.build_queries(cfg)
@@ -238,21 +235,6 @@ def stage_collect(args) -> int:
                 f"{len(cards)} cards, {kept} kept")
         if li.calls_used:
             log(f"  LinkedIn calls used: {li.calls_used}")
-
-    # Truncated sources count as thin regardless of length: Adzuna always returns
-    # exactly 500 characters ending in an ellipsis, which would otherwise sail past
-    # the min_body_chars gate and get scored as if it were the full posting.
-    thin = [j for j in raw_hits
-            if j.get("url")
-            and (j.get("truncated") or len(j.get("body", "")) < rules["min_body_chars"])]
-    if thin:
-        log(f"  enriching {len(thin)} thin postings (free fetch -> jsonld -> gemini)")
-        methods: dict[str, int] = {}
-        for job in thin:
-            job, method = extract.enrich(job, gemini=gem,
-                                         min_chars=rules["min_body_chars"], log=log)
-            methods[method] = methods.get(method, 0) + 1
-        log("    " + ", ".join(f"{k}={v}" for k, v in sorted(methods.items())))
 
     # ---- Firecrawl discovery.
     if fc:
@@ -298,9 +280,24 @@ def stage_collect(args) -> int:
         if ind_index:
             log(f"  IND register: {ind_index.get('__count__')} recognised sponsors loaded")
 
-    # ---- Dedup + prescreen.
+    # ---- Dedup + title screen, BEFORE any page is fetched.
+    # Enrichment used to run over every raw hit, so each morning re-fetched the page
+    # (and often paid a Gemini call) for postings already in the store, and for
+    # senior/manager titles that were about to be rejected anyway. Neither needs a
+    # description to be ruled out.
     candidates, seen_this_run = [], set()
     dupes_in_run = already_known = screened_out = 0
+    survivors: list[dict] = []
+
+    def reject(job: dict, reason: str):
+        nonlocal screened_out
+        screened_out += 1
+        note_reject(reason)
+        # Remember durable rejects so tomorrow they are "already known" before their
+        # page is fetched again. A thin-body reject is not durable: it is as often a
+        # failed fetch as an empty posting, and gets another chance.
+        if not args.dry_run and prescore.is_durable(reason):
+            store.insert_rejected(job, reason)
 
     for job in raw_hits:
         if job["canonical_url"] in seen_this_run:
@@ -315,11 +312,51 @@ def stage_collect(args) -> int:
                 store.touch(existing["fingerprint"])
             continue
 
+        reason = prescore.title_reject(job["title"], geo_rules.get(job["geo"], rules))
+        if reason:
+            reject(job, reason)
+            continue
+        survivors.append(job)
+
+    # ---- Fill in bodies the sources left thin: bol.com stubs its description to
+    # "<p>x</p>", Adzuna truncates at 500 characters, LinkedIn cards carry none.
+    # Truncated sources count as thin regardless of length — Adzuna's ellipsised
+    # snippet would otherwise sail past min_body_chars and be scored as the full
+    # posting. Free fetch + JSON-LD first, Gemini only for pages without JSON-LD.
+    fetcher = extract.PageFetcher(quota=quota, log=log,
+                                  delay=cfg.get("linkedin", {}).get("delay_seconds", 1.5))
+    thin = [j for j in survivors
+            if j.get("url")
+            and (j.get("truncated") or len(j.get("body", "")) < rules["min_body_chars"])]
+    if thin:
+        log(f"  enriching {len(thin)} thin postings (free fetch -> jsonld -> gemini)")
+        methods: dict[str, int] = {}
+        for job in thin:
+            job, method = extract.enrich(job, gemini=gem, min_chars=rules["min_body_chars"],
+                                         log=log, fetcher=fetcher)
+            methods[method] = methods.get(method, 0) + 1
+            job["enriched_by"] = method
+        log("    " + ", ".join(f"{k}={v}" for k, v in sorted(methods.items())))
+
+    # ---- Full prescreen on the bodies.
+    for job in survivors:
+        # A posting found by two sources under two URLs on the same morning: the first
+        # copy was inserted a moment ago, so the store now recognises the second.
+        if not args.dry_run and store.is_known(job, dedup["fuzzy_ratio"],
+                                               dedup["lookback_days"]):
+            dupes_in_run += 1
+            continue
+
         keep, reason, flags = prescore.screen(job, geo_rules.get(job["geo"], rules))
         if not keep:
-            screened_out += 1
-            note_reject(reason)
+            reject(job, reason)
             continue
+
+        if job.get("truncated") and job.get("enriched_by") not in ("jsonld", "gemini",
+                                                                    "heuristic"):
+            # The page could not be fetched, so the regex gates above only saw the
+            # source's snippet. Say so rather than presenting it as fully screened.
+            flags.append("description truncated - check the requirements before applying")
 
         if geo_visa_mode.get(job["geo"]) == "ind_sponsor":
             sponsor = fetch.is_recognised_sponsor(
@@ -334,7 +371,9 @@ def stage_collect(args) -> int:
             else:
                 flags.append("sponsor status unknown")
 
-        job["flags"] = flags
+        # Keep what enrichment noted (e.g. Gemini's quoted language requirement) —
+        # this used to be overwritten by the prescreen's own list.
+        job["flags"] = list(dict.fromkeys((job.get("flags") or []) + flags))
         job["fingerprint"] = nz.fingerprint(job["company"], job["title"], job["location"])
         if not args.dry_run:
             store.insert_new(job)

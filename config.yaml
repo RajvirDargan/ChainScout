@@ -106,6 +106,13 @@ sources:
     # unauthenticated endpoint — if 429s start appearing, cut the city list before
     # raising this again.
     daily_calls: 70
+  linkedin_detail:
+    # The job page behind each NEW LinkedIn card (cards carry no description). Same
+    # service, same politeness: paced at linkedin.delay_seconds, capped here, and a
+    # 429 / sign-in redirect stops page fetches for the rest of the run. Known jobs
+    # are deduped before this, so a normal day needs a few dozen.
+    enabled: true
+    daily_calls: 150
   firecrawl:
     enabled: false           # OFF. Set enabled:true + a monthly cap to re-enable.
     monthly_credits: 0
