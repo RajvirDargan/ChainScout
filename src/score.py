@@ -198,20 +198,39 @@ def apply_ceiling(job: dict, max_years: int, watchlist: int) -> dict:
     return job
 
 
+def from_stored(job: dict, max_years: int = 3, watchlist: int = 45) -> dict:
+    """A carried-forward job's earlier score, in the shape score_jobs returns."""
+    return apply_ceiling({
+        **{k: job.get(k) for k in ("fingerprint", "url", "title", "company",
+                                   "location", "geo", "source", "posted_date")},
+        "score": _clamp(job.get("score"), 0, 100),
+        "rationale": job.get("rationale") or "",
+        "flags": list(job.get("flags") or []),
+        "breakdown": {},
+        "years_required": job.get("years_required") or 0,
+        "score_reused": True,
+    }, max_years, watchlist)
+
+
 def score_jobs(jobs: list[dict], profile: str, chain, batch_size: int = 10,
-               log=print, max_years: int = 3, watchlist: int = 45
-               ) -> tuple[list[dict], list[dict]]:
+               log=print, max_years: int = 3, watchlist: int = 45,
+               max_seconds: int = 0) -> tuple[list[dict], list[dict]]:
     """Score every job. Returns (scored, unscored).
 
     Unscored jobs are NOT failures to be written off — the caller leaves them queued so
     they carry into tomorrow, the same rule that protects a failed send.
+
+    `max_seconds` bounds the whole pass. With a 900s backend timeout and the 10 -> 3 -> 1
+    retry cascade, a struggling backend could otherwise hold the run (and its lock) for
+    hours; past the budget, whatever is left is carried forward instead.
     """
     scored: dict[str, dict] = {}
     t_start = time.time()
     queue = list(jobs)
     size = max(1, batch_size)
+    out_of_time = False
 
-    while queue and size >= 1:
+    while queue and size >= 1 and not out_of_time:
         pending = [j for j in queue if j["fingerprint"] not in scored]
         if not pending:
             break
@@ -220,6 +239,11 @@ def score_jobs(jobs: list[dict], profile: str, chain, batch_size: int = 10,
         progressed = False
 
         for i, batch in enumerate(batches, 1):
+            if max_seconds and time.time() - t_start > max_seconds:
+                log(f"    ! scoring budget of {max_seconds}s spent — carrying the rest "
+                    f"forward")
+                out_of_time = True
+                break
             wanted = {j["fingerprint"]: j for j in batch}
             t0 = time.time()
             payload = chain.complete(build_prompt(profile, batch), SCHEMA)

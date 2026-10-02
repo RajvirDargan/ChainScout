@@ -30,6 +30,8 @@ def sandbox(monkeypatch):
     (base / "outbox").mkdir()
     monkeypatch.setattr(run, "wait_for_network", lambda *a, **k: True)
     monkeypatch.setattr(run.mailer_src, "credentials", lambda env: ("a@b.c", "pw"))
+    # Never touch real SMTP — a failing run now sends an alert.
+    monkeypatch.setattr(run.mailer_src, "send", lambda *a, **k: "<alert@test>")
     calls = []
     return base, calls
 
@@ -211,3 +213,103 @@ def test_a_later_collect_does_not_erase_the_commit_record():
     row = store.conn.execute("SELECT * FROM runs WHERE run_date = ?", (DAY,)).fetchone()
     assert store.committed(DAY)
     assert (row["collected"], row["sent"]) == (140, 12)
+
+
+# ------------------------------------------------------------- failure alerts
+
+def test_a_failed_run_alerts_once_a_day(sandbox, monkeypatch):
+    base, calls = sandbox
+    sent = []
+    monkeypatch.setattr(run.mailer_src, "send",
+                        lambda env, to, subject, text, html, log=None: sent.append(subject))
+    assert run._run_guarded("main", DAY, lambda: 4) == 4
+    assert run._run_guarded("main", DAY, lambda: 4) == 4
+    assert len(sent) == 1 and "run failed" in sent[0]
+
+
+def test_a_crash_becomes_a_logged_failure_and_an_alert(sandbox, monkeypatch):
+    base, calls = sandbox
+    sent = []
+    monkeypatch.setattr(run.mailer_src, "send",
+                        lambda env, to, subject, text, html, log=None: sent.append(text))
+
+    def boom():
+        raise KeyError("results")
+
+    assert run._run_guarded("main", DAY, boom) == 1
+    assert "KeyError" in sent[0]
+    assert "KeyError" in (base / "logs" / f"run-{DAY}.log").read_text()
+
+
+def test_a_quiet_run_sends_no_alert(sandbox, monkeypatch):
+    sent = []
+    monkeypatch.setattr(run.mailer_src, "send", lambda *a, **k: sent.append(a))
+    assert run._run_guarded("main", DAY, lambda: 0) == 0
+    assert sent == []
+
+
+def test_an_unsendable_alert_never_masks_the_failure(sandbox, monkeypatch):
+    def refuse(*a, **k):
+        raise run.mailer_src.MailerError("no credentials")
+    monkeypatch.setattr(run.mailer_src, "send", refuse)
+    assert run._run_guarded("main", DAY, lambda: 2) == 2
+
+
+# ----------------------------------------------------------- carry-forward
+
+def test_a_carried_job_with_a_score_is_not_rescored(sandbox, monkeypatch):
+    base, calls = sandbox
+    carried = {**_job(1), "fingerprint": "fp-carried", "carried_forward": True,
+               "score": 72, "rationale": "Fits. Check the visa.", "flags": ["English"]}
+    _write(base, "candidates", {"scanned": 10, "candidates": [carried]})
+
+    def no_llm(*a, **k):
+        raise AssertionError("a stored score must not be paid for again")
+
+    monkeypatch.setattr(run.llm_src, "build", no_llm)
+    assert run.stage_score(run._ns(date=DAY, channel="main", dry_run=False, limit=0)) == 0
+    scored = json.loads((base / "outbox" / f"{DAY}_scored.json").read_text())
+    assert [(j["fingerprint"], j["score"]) for j in scored["jobs"]] == [("fp-carried", 72)]
+    assert scored["unscored_count"] == 0
+
+
+def test_a_job_queued_too_long_is_retired():
+    store = Store(Path(tempfile.mkdtemp()) / "seen.sqlite")
+    old = store.insert_new(_job(1))
+    fresh = store.insert_new(_job(2))
+    store.conn.execute("UPDATE jobs SET first_seen = '2026-01-01T00:00:00+00:00' "
+                       "WHERE fingerprint = ?", (old,))
+    assert store.expire_stale(21) == 1
+    assert [c["fingerprint"] for c in store.unsent_carry_forward(set())] == [fresh]
+    assert store.is_known(_job(1)) is not None, "retired, not forgotten"
+
+
+# ---------------------------------------------------------------- timezone
+
+def test_the_run_date_follows_the_configured_timezone():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    for tz in ("Pacific/Kiritimati", "Pacific/Pago_Pago"):     # UTC+14 and UTC-11
+        assert run.today_iso({"timezone": tz}) == \
+            datetime.now(ZoneInfo(tz)).date().isoformat()
+    assert run.today_iso({"timezone": "Not/AZone"})               # falls back, no crash
+
+
+# ----------------------------------------------------------- scoring budget
+
+def test_the_scoring_pass_stops_at_its_time_budget(monkeypatch):
+    import score
+
+    clock = iter(range(0, 10_000, 100))
+    monkeypatch.setattr(score.time, "time", lambda: next(clock))
+
+    class Slow:
+        name, last_model = "slow", "s"
+
+        def complete(self, prompt, schema=None):
+            return None                      # every batch fails; time keeps passing
+
+    jobs = [{**_job(i), "fingerprint": f"f{i}"} for i in range(30)]
+    scored, unscored = score.score_jobs(jobs, "P", Slow(), batch_size=10,
+                                        log=lambda *_: None, max_seconds=250)
+    assert scored == [] and len(unscored) == 30

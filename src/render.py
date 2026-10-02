@@ -37,14 +37,15 @@ def flag_severity(text: str) -> str:
     return "neutral"
 
 
-def humanize_date(raw: str) -> str:
+def humanize_date(raw: str, today: date | None = None) -> str:
     if not raw:
         return ""
+    today = today or date.today()
     for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S",
                 "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(raw[:len(datetime.now().strftime(fmt))], fmt)
-            days = (date.today() - dt.date()).days
+            days = (today - dt.date()).days
             if days <= 0:
                 return "posted today"
             if days == 1:
@@ -75,7 +76,7 @@ def _selection_key(job: dict):
     return -int(job.get("score") or 0)
 
 
-def prepare(jobs: list[dict]) -> list[dict]:
+def prepare(jobs: list[dict], today: date | None = None) -> list[dict]:
     out = []
     for j in sorted(jobs, key=_display_key):
         flags = [{"text": f, "severity": flag_severity(f)} for f in (j.get("flags") or [])]
@@ -84,7 +85,7 @@ def prepare(jobs: list[dict]) -> list[dict]:
         # its place.
         if j.get("geo"):
             flags.insert(0, {"text": GEO_LABEL.get(j["geo"], j["geo"]), "severity": "neutral"})
-        out.append({**j, "flags": flags, "posted_human": humanize_date(j.get("posted_date", ""))})
+        out.append({**j, "flags": flags, "posted_human": humanize_date(j.get("posted_date", ""), today)})
     return out
 
 
@@ -109,7 +110,9 @@ def build(scored: list[dict], cfg: dict, meta: dict) -> tuple[str, str, str, lis
     picked = {id(j) for j in selected}
     selected += [j for j in by_score if id(j) not in picked][: cap - len(selected)]
     selected = sorted(selected, key=_selection_key)
-    jobs = prepare(selected)
+    run_date = meta.get("run_date") or date.today().isoformat()
+    today = datetime.strptime(run_date, "%Y-%m-%d").date()
+    jobs = prepare(selected, today)
 
     def bands(pool):
         return (
@@ -125,8 +128,7 @@ def build(scored: list[dict], cfg: dict, meta: dict) -> tuple[str, str, str, lis
     apply_now, worth_look, watchlist = bands(jobs)
 
     filing = datetime.strptime(str(cfg["deadlines"]["sponsor_filing"]), "%Y-%m-%d").date()
-    days_to_filing = (filing - date.today()).days
-    run_date = meta.get("run_date") or date.today().isoformat()
+    days_to_filing = (filing - today).days
 
     ctx = {
         "run_date": run_date,
@@ -145,6 +147,7 @@ def build(scored: list[dict], cfg: dict, meta: dict) -> tuple[str, str, str, lis
         "sources_line": meta.get("sources_line", ""),
         "llm_usage": meta.get("llm_usage", ""),
         "unscored": meta.get("unscored", 0),
+        "warnings": meta.get("warnings") or [],
         "watchlist_threshold": th["watchlist"],
         "is_test": meta.get("is_test", False),
         "channel": meta.get("channel") or "main",
@@ -218,6 +221,8 @@ def _plaintext(ctx: dict) -> str:
         lines.append(f"scored by {ctx['llm_usage']}")
     if ctx.get("unscored"):
         lines.append(f"{ctx['unscored']} could not be scored today and carry into tomorrow")
+    for w in ctx.get("warnings") or []:
+        lines.append(f"! {w}")
     lines += [
               "job_agent · ~/Downloads/10_job_applications/job_agent"]
     return "\n".join(lines)

@@ -263,21 +263,8 @@ def test_careers_landing_pages_without_jsonld_are_rejected():
 # ---------------------------------------------------------------- candidate cap
 
 def _round_robin(candidates, cap, prio):
-    """Mirror of the cap logic in run.py collect(). Kept in the test rather than
-    imported because collect() is one long function with live network calls."""
-    by_geo = {}
-    for j in candidates:
-        by_geo.setdefault(j.get("geo") or "", []).append(j)
-    queues = [by_geo[g] for g in sorted(by_geo, key=lambda g: (prio.get(g, 9), g))]
-    picked = []
-    while len(picked) < cap and any(queues):
-        for q in queues:
-            if not q:
-                continue
-            picked.append(q.pop(0))
-            if len(picked) >= cap:
-                break
-    return picked
+    import run
+    return run.round_robin(candidates, cap, prio)
 
 
 def test_candidate_cap_does_not_starve_low_priority_geographies():

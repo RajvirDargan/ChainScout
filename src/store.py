@@ -54,6 +54,7 @@ STATUS_NEW = "new"
 STATUS_SENT = "sent"
 STATUS_BELOW = "below_threshold"
 STATUS_REJECTED = "rejected"
+STATUS_EXPIRED = "expired"      # never emailed, and carried longer than anyone should wait
 
 
 class Store:
@@ -169,7 +170,7 @@ class Store:
         row = self._by_fingerprint(fp)
         if row is None:
             return None
-        if row["status"] in (STATUS_SENT, STATUS_BELOW) and \
+        if row["status"] in (STATUS_SENT, STATUS_BELOW, STATUS_EXPIRED) and \
                 (row["last_seen"] or "") < self._cutoff(lookback_days):
             return None
         # A v1 key also merged internships into the full-time role; only accept a v1 hit
@@ -211,7 +212,7 @@ class Store:
         fp = nz.fingerprint(job["company"], job["title"], job["location"])
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         old = self._by_fingerprint(fp)
-        if old is not None and old["status"] in (STATUS_SENT, STATUS_BELOW):
+        if old is not None and old["status"] in (STATUS_SENT, STATUS_BELOW, STATUS_EXPIRED):
             self.conn.execute(
                 """UPDATE jobs SET url = ?, source = ?, salary_text = ?, posted_date = ?,
                        body = ?, flags = ?, first_seen = ?, last_seen = ?, status = ?,
@@ -286,6 +287,22 @@ class Store:
         )
         self.conn.commit()
 
+    def expire_stale(self, max_days: int) -> int:
+        """Retire never-emailed jobs first collected more than `max_days` ago.
+
+        Carry-forward had no end: a role crowded out of the email by higher scorers was
+        re-scored every morning for as long as it lived in the store, long after the
+        posting itself had closed. Returns how many were retired.
+        """
+        if not max_days:
+            return 0
+        cutoff = self._cutoff(max_days)
+        cur = self.conn.execute(
+            "UPDATE jobs SET status = ? WHERE status = ? AND sent_on IS NULL "
+            "AND first_seen < ?", (STATUS_EXPIRED, STATUS_NEW, cutoff))
+        self.conn.commit()
+        return cur.rowcount
+
     def record_run(self, run_date: str, collected: int | None, new_jobs: int | None,
                    sent: int | None, notes: str = ""):
         """Upsert the run row. A None (or empty notes) leaves the stored value alone.
@@ -337,7 +354,8 @@ class Store:
         own email, so its leftovers must carry into that email, never the 07:30 one.
         """
         rows = self.conn.execute(
-            "SELECT * FROM jobs WHERE status = ? AND sent_on IS NULL", (STATUS_NEW,)
+            "SELECT * FROM jobs WHERE status = ? AND sent_on IS NULL ORDER BY first_seen",
+            (STATUS_NEW,)
         ).fetchall()
         out = []
         for r in rows:
@@ -354,6 +372,10 @@ class Store:
                 "salary_text": r["salary_text"] or "", "posted_date": r["posted_date"] or "",
                 "body": r["body"] or "", "source": r["source"], "geo": r["geo"],
                 "flags": [f for f in (r["flags"] or "").split("; ") if f],
+                # A score already paid for (a role deferred by max_jobs_email, or one
+                # whose send failed) is reused rather than bought again every morning.
+                "score": r["score"],
+                "rationale": r["rationale"] or "",
                 "carried_forward": True,
             })
         return out

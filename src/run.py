@@ -15,11 +15,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import html as html_mod
 import socket
 import sys
 import time
+import traceback
 from datetime import date, datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
@@ -72,6 +75,26 @@ def load_config() -> dict:
     return yaml.safe_load(CONFIG.read_text())
 
 
+def local_now(cfg: dict | None = None) -> datetime:
+    """Now, in the configured `timezone`.
+
+    Everything used the machine's clock, so a laptop carried to another timezone (or a
+    run that straddled midnight) split one day's manifests, quota ledger and
+    already-sent guard across two dates. An unknown zone falls back to the machine's.
+    """
+    tz = (cfg if cfg is not None else load_config()).get("timezone")
+    if tz:
+        try:
+            return datetime.now(ZoneInfo(tz))
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    return datetime.now()
+
+
+def today_iso(cfg: dict | None = None) -> str:
+    return local_now(cfg).date().isoformat()
+
+
 class Logger:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -86,9 +109,30 @@ class Logger:
 
 # --------------------------------------------------------------------- collect
 
+def round_robin(jobs: list[dict], cap: int, prio: dict[str, int]) -> list[dict]:
+    """Up to `cap` jobs, taken one per geography per round, in priority order.
+
+    Each geography keeps its own order (oldest carried job first, then freshest-first
+    from the sources); best-score-first is not available because nothing is scored yet.
+    """
+    by_geo: dict[str, list] = {}
+    for j in jobs:
+        by_geo.setdefault(j.get("geo") or "", []).append(j)
+    queues = [list(by_geo[g]) for g in sorted(by_geo, key=lambda g: (prio.get(g, 9), g))]
+    picked: list[dict] = []
+    while len(picked) < cap and any(queues):
+        for q in queues:
+            if not q:
+                continue
+            picked.append(q.pop(0))
+            if len(picked) >= cap:
+                break
+    return picked
+
+
 def stage_collect(args) -> int:
     cfg = load_config()
-    run_date = args.date or date.today().isoformat()
+    run_date = args.date or today_iso(cfg)
     log = Logger(LOGS / f"run-{run_date}.log")
     log(f"=== collect {run_date} {'(DRY RUN)' if args.dry_run else ''}")
 
@@ -116,7 +160,8 @@ def stage_collect(args) -> int:
     rejects: dict[str, int] = {}
     per_source: dict[str, int] = {}
 
-    quota = Quota(store.conn, cfg.get("sources", {}), log=log)
+    quota = Quota(store.conn, cfg.get("sources", {}), log=log,
+                  today=local_now(cfg).date())
 
     adz = adzuna_src.Adzuna(env.get("ADZUNA_APP_ID", ""), env.get("ADZUNA_APP_KEY", ""),
                             quota=quota, log=log)
@@ -138,6 +183,18 @@ def stage_collect(args) -> int:
 
     def note_reject(reason: str):
         rejects[reason] = rejects.get(reason, 0) + 1
+
+    errors: list[str] = []
+
+    def safe(label: str, fn, *a, default=None, **kw):
+        """One bad record or response must not abort the whole morning. The ATS loop
+        always caught its errors; Adzuna, LinkedIn and enrichment now do too."""
+        try:
+            return fn(*a, **kw)
+        except Exception as exc:  # noqa: BLE001 - logged, counted, surfaced in the digest
+            errors.append(label)
+            log(f"  ! {label}: {type(exc).__name__}: {exc}")
+            return default
 
     # ---- ATS boards first: exact, free, and they carry most of the signal.
     kws = [k.lower() for k in cfg["ats"].get("title_keywords", [])]
@@ -180,10 +237,11 @@ def stage_collect(args) -> int:
         max_days = cfg.get("adzuna", {}).get("max_days_old", 7)
         log(f"  Adzuna: {len(queries)} calls (50 results each)")
         for i, q in enumerate(queries, 1):
-            recs = adz.search(q["what"], q["country"], max_days_old=max_days)
+            recs = safe(f"adzuna {q['geo']} {q['what']!r}", adz.search, q["what"],
+                        q["country"], max_days_old=max_days, default=[]) or []
             kept = 0
             for rec in recs:
-                job = adzuna_src.to_job(rec, q["geo"])
+                job = safe("adzuna record", adzuna_src.to_job, rec, q["geo"])
                 if job is None:
                     note_reject("adzuna_incomplete_record")
                     continue
@@ -206,18 +264,20 @@ def stage_collect(args) -> int:
         log(f"  Adzuna calls used: {adz.calls_used}")
 
     # ---- LinkedIn guest search: the only free source that reaches the Gulf.
+    linkedin_cards = 0
     if quota.enabled("linkedin"):
         lqueries = linkedin_src.build_queries(cfg)
         lcfg = cfg.get("linkedin", {})
         if lqueries:
             log(f"  LinkedIn: {len(lqueries)} queries x {lcfg.get('pages_per_query',2)} pages")
         for i, q in enumerate(lqueries, 1):
-            cards = li.search(q["keywords"], q["location"],
-                              days=lcfg.get("days", 7),
-                              pages=lcfg.get("pages_per_query", 2))
+            cards = safe(f"linkedin {q['geo']} {q['keywords']!r}", li.search,
+                         q["keywords"], q["location"], days=lcfg.get("days", 7),
+                         pages=lcfg.get("pages_per_query", 2), default=[]) or []
+            linkedin_cards += len(cards)
             kept = 0
             for card in cards:
-                job = linkedin_src.to_job(card, q["geo"])
+                job = safe("linkedin card", linkedin_src.to_job, card, q["geo"])
                 if job is None:
                     note_reject("linkedin_unparsable_card")
                     continue
@@ -332,8 +392,9 @@ def stage_collect(args) -> int:
         log(f"  enriching {len(thin)} thin postings (free fetch -> jsonld -> gemini)")
         methods: dict[str, int] = {}
         for job in thin:
-            job, method = extract.enrich(job, gemini=gem, min_chars=rules["min_body_chars"],
-                                         log=log, fetcher=fetcher)
+            job, method = safe(f"enrich {job.get('url', '')[:60]}", extract.enrich, job,
+                               gemini=gem, min_chars=rules["min_body_chars"], log=log,
+                               fetcher=fetcher, default=(job, "error"))
             methods[method] = methods.get(method, 0) + 1
             job["enriched_by"] = method
         log("    " + ", ".join(f"{k}={v}" for k, v in sorted(methods.items())))
@@ -379,50 +440,15 @@ def stage_collect(args) -> int:
             store.insert_new(job)
         candidates.append(job)
 
-    # A cold start sweeps a 7-day window and can yield hundreds. Cap what goes for
-    # scoring so the scheduled run stays tractable.
-    #
-    # This takes a ROUND-ROBIN across geographies, not the configured priority order.
-    # Strict priority starves the low-priority end permanently: Germany alone yields
-    # ~165 candidates against a cap of 60, so a priority sort gave Germany all 60 slots
-    # and Belgium, Ireland, Poland, the Gulf and India zero — every run, forever, since
-    # dropped candidates are deleted from the store and re-collected identically the
-    # next morning. Priority still breaks ties *within* a round, so Germany keeps first
-    # pick; it just no longer takes the whole table.
-    cap = cfg.get("thresholds", {}).get("max_candidates_per_run", 0)
-    if cap and len(candidates) > cap:
-        prio = {g["id"]: g.get("priority", 9) for g in cfg["geographies"]}
-        by_geo: dict[str, list] = {}
-        for j in candidates:
-            by_geo.setdefault(j.get("geo") or "", []).append(j)
-        # Best score first is not available yet (scoring happens after this), so keep
-        # each geography's collection order — freshest-first from the sources.
-        queues = [by_geo[g] for g in sorted(by_geo, key=lambda g: (prio.get(g, 9), g))]
-        picked = []
-        while len(picked) < cap and any(queues):
-            for q in queues:
-                if not q:
-                    continue
-                picked.append(q.pop(0))
-                if len(picked) >= cap:
-                    break
-        kept_ids = {id(j) for j in picked}
-        dropped = [j for j in candidates if id(j) not in kept_ids]
-        spread = ", ".join(
-            f"{g}:{sum(1 for j in picked if j.get('geo') == g)}"
-            for g in sorted({j.get("geo") for j in picked}, key=lambda g: prio.get(g, 9)))
-        log(f"  capping {len(candidates)} candidates to {cap} for this run "
-            f"(round-robin: {spread})")
-        candidates = picked
-        for j in dropped:
-            store.conn.execute("DELETE FROM jobs WHERE fingerprint = ?", (j["fingerprint"],))
-        store.conn.commit()
-
     new_this_run = len(candidates)
 
     # Roles collected on an earlier run that never made it into an email.
-    carried = []
+    carried, carried_scored = [], []
     if not args.dry_run:
+        max_days = int(cfg.get("thresholds", {}).get("carry_forward_max_days", 0) or 0)
+        expired = store.expire_stale(max_days)
+        if expired:
+            log(f"  retired {expired} never-emailed job(s) older than {max_days} days")
         # Re-screen carried-forward jobs against the CURRENT rules. They were stored
         # under whatever rules existed on the day they were found, so without this a
         # tightened ceiling never applies retroactively and stale roles keep costing
@@ -439,13 +465,49 @@ def stage_collect(args) -> int:
                     (job["fingerprint"],))
                 dropped_stale += 1
                 continue
-            job["flags"] = flags or job.get("flags") or []
-            carried.append(job)
+            job["flags"] = list(dict.fromkeys((job.get("flags") or []) + flags))
+            (carried_scored if job.get("score") is not None else carried).append(job)
         store.conn.commit()
         if dropped_stale:
             log(f"  re-screened carry-forwards: dropped {dropped_stale} "
                 f"under the current rules")
-        candidates.extend(carried)
+
+    # A cold start sweeps a 7-day window and can yield hundreds. Cap what goes for
+    # scoring so the scheduled run stays tractable. The cap covers every job that will
+    # cost an LLM call — carried-forward jobs that still need a score included, which
+    # it used not to, so a growing backlog quietly grew the scoring bill. Jobs that
+    # already carry a score cost nothing and are not counted.
+    #
+    # This takes a ROUND-ROBIN across geographies, not the configured priority order.
+    # Strict priority starves the low-priority end permanently: Germany alone yields
+    # ~165 candidates against a cap of 60, so a priority sort gave Germany all 60 slots
+    # and Belgium, Ireland, Poland, the Gulf and India zero — every run, forever, since
+    # dropped candidates are deleted from the store and re-collected identically the
+    # next morning. Priority still breaks ties *within* a round, so Germany keeps first
+    # pick; it just no longer takes the whole table.
+    to_score = carried + candidates           # oldest first within each geography
+    cap = cfg.get("thresholds", {}).get("max_candidates_per_run", 0)
+    if cap and len(to_score) > cap:
+        prio = {g["id"]: g.get("priority", 9) for g in cfg["geographies"]}
+        picked = round_robin(to_score, cap, prio)
+        kept_ids = {id(j) for j in picked}
+        spread = ", ".join(
+            f"{g}:{sum(1 for j in picked if j.get('geo') == g)}"
+            for g in sorted({j.get("geo") for j in picked}, key=lambda g: prio.get(g, 9)))
+        log(f"  capping {len(to_score)} jobs to score to {cap} for this run "
+            f"(round-robin: {spread})")
+        # A new job that missed the cut is forgotten and re-collected tomorrow; a
+        # carried one simply stays queued.
+        for j in candidates:
+            if id(j) not in kept_ids and not args.dry_run:
+                store.conn.execute("DELETE FROM jobs WHERE fingerprint = ?",
+                                   (j["fingerprint"],))
+        store.conn.commit()
+        new_this_run = sum(1 for j in candidates if id(j) in kept_ids)
+        carried = [j for j in carried if id(j) in kept_ids]
+        to_score = picked
+    carried = carried + carried_scored
+    candidates = to_score + carried_scored
 
     log("")
     log(f"  collected            {len(raw_hits)}")
@@ -453,11 +515,29 @@ def stage_collect(args) -> int:
     log(f"  already in store     {already_known}")
     log(f"  screened out         {screened_out}")
     log(f"  NEW this run         {new_this_run}")
-    log(f"  carried forward      {len(carried)}   (collected earlier, never emailed)")
+    log(f"  carried forward      {len(carried)}   (collected earlier, never emailed; "
+        f"{len(carried_scored)} already scored)")
     log(f"  TO SCORE             {len(candidates)}")
     if rejects:
         log("  rejects: " + ", ".join(f"{k}={v}" for k, v in
                                       sorted(rejects.items(), key=lambda x: -x[1])))
+
+    # Things that went wrong without failing the run. They used to live only in the
+    # log, so a source that broke quietly showed up as a thinner digest and nothing else.
+    warnings = [f"{src}: daily or monthly cap reached — later calls were skipped"
+                for src in quota.exhausted()]
+    if li.blocked:
+        warnings.append("LinkedIn rate-limited the search — LinkedIn results are partial")
+    if fetcher.blocked:
+        warnings.append("LinkedIn blocked job pages — affected postings retry tomorrow")
+    unparsable = rejects.get("linkedin_unparsable_card", 0)
+    if linkedin_cards >= 20 and unparsable > linkedin_cards / 2:
+        warnings.append(f"{unparsable} of {linkedin_cards} LinkedIn cards could not be "
+                        f"parsed — the card markup has probably changed")
+    if errors:
+        warnings.append(f"{len(errors)} source error(s) during collection — see the log")
+    for w in warnings:
+        log(f"  ! health: {w}")
 
     if not args.dry_run:
         OUTBOX.mkdir(parents=True, exist_ok=True)
@@ -468,6 +548,7 @@ def stage_collect(args) -> int:
             "already_known": already_known,
             "screened_out": screened_out,
             "sources_line": ", ".join(f"{k} {v}" for k, v in per_source.items() if v),
+            "warnings": warnings,
             "candidates": candidates,
         }, indent=2, ensure_ascii=False))
         store.record_run(run_date, len(raw_hits), len(candidates), None)
@@ -479,9 +560,35 @@ def stage_collect(args) -> int:
 
 # ---------------------------------------------------------------------- render
 
+def _indeed_staleness(run_date: str, days: int = 2) -> str | None:
+    """A warning when the Indeed channel has gone quiet.
+
+    Its discovery runs inside the Claude desktop app, so a closed app means no Indeed
+    digest and, until now, no sign of it anywhere. Silent if the channel was never used.
+    """
+    store = Store(STATE / "seen.sqlite")
+    try:
+        row = store.conn.execute(
+            "SELECT MAX(run_date) d FROM runs WHERE run_date LIKE '%#indeed' "
+            "AND notes LIKE 'gmail:%'").fetchone()
+    finally:
+        store.close()
+    last = (row["d"] or "").split("#")[0] if row else ""
+    if not last:
+        return None
+    try:
+        gap = (date.fromisoformat(run_date) - date.fromisoformat(last)).days
+    except ValueError:
+        return None
+    if gap > days:
+        return (f"no Indeed India digest since {last} — the Claude desktop task "
+                f"'indeed-india-daily' only runs while the app is open")
+    return None
+
+
 def stage_render(args) -> int:
     cfg = load_config()
-    run_date = args.date or date.today().isoformat()
+    run_date = args.date or today_iso(cfg)
     log = log_for(run_date, args)
 
     scored_path = Path(args.scored) if args.scored else outbox_for(args) / f"{run_date}_scored.json"
@@ -493,6 +600,7 @@ def stage_render(args) -> int:
 
     cand_path = outbox_for(args) / f"{run_date}_candidates.json"
     meta = {"run_date": run_date, "is_test": args.test, "channel": channel_of(args)}
+    cand = {}
     if cand_path.exists():
         cand = json.loads(cand_path.read_text())
         meta["scanned"] = cand.get("scanned", 0)
@@ -500,6 +608,11 @@ def stage_render(args) -> int:
     # Which model actually scored today, so a backend fallback is visible in the digest.
     meta["llm_usage"] = payload.get("llm_usage", "") if isinstance(payload, dict) else ""
     meta["unscored"] = int(payload.get("unscored_count") or 0) if isinstance(payload, dict) else 0
+    meta["warnings"] = list(cand.get("warnings") or []) if cand_path.exists() else []
+    if channel_of(args) == "main":
+        stale = _indeed_staleness(run_date)
+        if stale:
+            meta["warnings"].append(stale)
 
     subject, html, text, rendered_fps = render.build(scored, cfg, meta)
 
@@ -545,7 +658,7 @@ def stage_render(args) -> int:
 
 def stage_commit(args) -> int:
     cfg = load_config()
-    run_date = args.date or date.today().isoformat()
+    run_date = args.date or today_iso(cfg)
     log = log_for(run_date, args)
 
     email_path = outbox_for(args) / f"{run_date}_email.json"
@@ -590,7 +703,7 @@ def stage_commit(args) -> int:
 def stage_score(args) -> int:
     """Score today's candidates with the LLM chain. This is the step Claude used to do."""
     cfg = load_config()
-    run_date = args.date or date.today().isoformat()
+    run_date = args.date or today_iso(cfg)
     log = log_for(run_date, args)
     log(f"=== score {run_date}{' (DRY RUN)' if args.dry_run else ''}")
 
@@ -611,16 +724,32 @@ def stage_score(args) -> int:
     if channel_of(args) == "indeed" and INDIA_ADDENDUM.exists():
         # Same rubric; only the India location band changes for this digest.
         profile += "\n\n" + INDIA_ADDENDUM.read_text()
-    store = Store(STATE / "seen.sqlite")
-    quota = Quota(store.conn, cfg.get("sources", {}), log=log)
-    env = fetch.load_env(ROOT / ".env")
-    chain = llm_src.build(cfg, env, quota=quota, log=log)
+    max_years = int(cfg["prescreen"].get("max_years_experience", 3))
+    watchlist = int(cfg["thresholds"]["watchlist"])
+    llm_cfg = cfg.get("llm", {}) or {}
 
-    scored, unscored = score_src.score_jobs(
-        candidates, profile, chain,
-        batch_size=cfg.get("llm", {}).get("batch_size", 10), log=log,
-        max_years=int(cfg["prescreen"].get("max_years_experience", 3)),
-        watchlist=int(cfg["thresholds"]["watchlist"]))
+    # Carried-forward jobs that already hold a score keep it; only the rest cost a call.
+    reused = [score_src.from_stored(j, max_years, watchlist) for j in candidates
+              if j.get("carried_forward") and j.get("score") is not None]
+    need = [j for j in candidates
+            if not (j.get("carried_forward") and j.get("score") is not None)]
+
+    store = Store(STATE / "seen.sqlite")
+    quota = Quota(store.conn, cfg.get("sources", {}), log=log,
+                  today=local_now(cfg).date())
+    env = fetch.load_env(ROOT / ".env")
+    if need:
+        chain = llm_src.build(cfg, env, quota=quota, log=log)
+        scored, unscored = score_src.score_jobs(
+            need, profile, chain,
+            batch_size=llm_cfg.get("batch_size", 10), log=log,
+            max_years=max_years, watchlist=watchlist,
+            max_seconds=int(llm_cfg.get("max_scoring_seconds", 0) or 0))
+    else:
+        chain, scored, unscored = llm_src.Chain(None), [], []
+    if reused:
+        log(f"  reused {len(reused)} stored score(s) for carried-forward jobs")
+    scored = scored + reused
 
     log(f"  scored {len(scored)} | unscored {len(unscored)} (carry forward)")
     log(f"  LLM usage: {chain.summary()}")
@@ -659,7 +788,7 @@ def stage_score(args) -> int:
 def stage_send(args) -> int:
     """Send the rendered digest over SMTP. Prints the Message-ID for commit."""
     cfg = load_config()
-    run_date = args.date or date.today().isoformat()
+    run_date = args.date or today_iso(cfg)
     log = log_for(run_date, args)
 
     email_path = outbox_for(args) / f"{run_date}_email.json"
@@ -815,14 +944,73 @@ def _fresh(path: Path, than: Path) -> bool:
         return False
 
 
+# Return codes that mean "nothing to do", not "something broke".
+QUIET_RCS = (0,)
+
+
+def alert_failure(channel: str, run_date: str, rc: int, detail: str = "") -> bool:
+    """Email the recipients once a day when a run fails to deliver.
+
+    A failed run used to leave a log file and nothing else: the only symptom was a
+    digest that never arrived, which reads exactly like a quiet day. At most one alert
+    per channel per day (a marker in state/), so the hourly retries don't spam. Never
+    raises — an alert that cannot be sent (no credentials, no network) is just logged.
+    """
+    cfg = load_config()
+    if not (cfg.get("alerts", {}) or {}).get("enabled", True):
+        return False
+    marker = STATE / f"alert-{channel}-{run_date}.sent"
+    if marker.exists():
+        return False
+    log_path = LOGS / (f"run-{run_date}.log" if channel == "main"
+                       else f"run-{run_date}-{channel}.log")
+    try:
+        tail = "\n".join(log_path.read_text().splitlines()[-40:])
+    except OSError:
+        tail = "(no log written)"
+    name = "Indeed India" if channel == "indeed" else "Job Agent"
+    subject = f"[{name}] run failed — {run_date} (rc={rc})"
+    text = (f"Today's {name} run did not deliver a digest (exit code {rc}). "
+            f"It retries on the next scheduled tick; nothing was marked as sent, so no "
+            f"role is lost.\n\n{detail + chr(10) * 2 if detail else ''}"
+            f"Last lines of {log_path.name}:\n\n{tail}\n")
+    html = f"<pre style='font-size:12px'>{html_mod.escape(text)}</pre>"
+    recipients = [r for r in (cfg.get("recipients") or [cfg.get("recipient")]) if r]
+    try:
+        mailer_src.send(fetch.load_env(ROOT / ".env"), recipients, subject, text, html,
+                        log=lambda *_: None)
+    except Exception as exc:  # noqa: BLE001 - an alert must never mask the real failure
+        print(f"could not send the failure alert: {exc}")
+        return False
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    return True
+
+
+def _run_guarded(channel: str, run_date: str, fn) -> int:
+    """Run a chain, turning a crash into a logged rc=1, and alert on any failure."""
+    detail = ""
+    try:
+        rc = fn()
+    except Exception:  # noqa: BLE001
+        detail = traceback.format_exc()
+        LOGS.mkdir(parents=True, exist_ok=True)
+        Logger(LOGS / (f"run-{run_date}.log" if channel == "main"
+                       else f"run-{run_date}-{channel}.log"))(f"! crashed:\n{detail}")
+        rc = 1
+    if rc not in QUIET_RCS:
+        alert_failure(channel, run_date, rc, detail)
+    return rc
+
+
 def stage_daily(args) -> int:
     """collect -> score -> render -> send -> commit. What launchd invokes.
 
     Any failure stops the chain before commit, so the jobs stay queued for tomorrow
     rather than being marked as sent.
     """
-    run_date = args.date or date.today().isoformat()
     cfg_all = load_config()
+    run_date = args.date or today_iso(cfg_all)
     sched = cfg_all.get("schedule", {}) or {}
 
     # --- Guard 1: already delivered AND committed today. Makes the whole run
@@ -838,7 +1026,7 @@ def stage_daily(args) -> int:
     # --- Guard 2: too early. A catch-up tick at 03:00 should wait, not deliver a
     # digest in the middle of the night.
     if not args.force:
-        now = datetime.now()
+        now = local_now(cfg_all)
         earliest = now.replace(hour=int(sched.get("earliest_hour", 7)),
                                minute=int(sched.get("earliest_minute", 30)),
                                second=0, microsecond=0)
@@ -857,7 +1045,7 @@ def stage_daily(args) -> int:
     lock.write_text(str(os.getpid()))
 
     try:
-        return _daily_stages(args, run_date)
+        return _run_guarded("main", run_date, lambda: _daily_stages(args, run_date))
     finally:
         lock.unlink(missing_ok=True)
 
@@ -964,7 +1152,7 @@ def stage_indeed_plan(args) -> int:
     calls), so only roles that are new to the store and pass the title gates get one.
     Ordered Delhi NCR -> Mumbai -> remote -> elsewhere, then as listed."""
     cfg = load_config()
-    run_date = args.date or date.today().isoformat()
+    run_date = args.date or today_iso(cfg)
     args.channel = "indeed"
     log = log_for(run_date, args)
     log(f"=== indeed-plan {run_date}")
@@ -1015,7 +1203,7 @@ def stage_indeed_plan(args) -> int:
 def stage_indeed_ingest(args) -> int:
     """Prescreen + store the fetched Indeed postings; write the channel's candidates."""
     cfg = load_config()
-    run_date = args.date or date.today().isoformat()
+    run_date = args.date or today_iso(cfg)
     args.channel = "indeed"
     log = log_for(run_date, args)
     log(f"=== indeed-ingest {run_date}")
@@ -1075,7 +1263,7 @@ def stage_indeed_daily(args) -> int:
 
     A separate email from the 07:30 digest, with its own manifest, lock and
     already-sent guard. Commit still only follows a real Message-ID."""
-    run_date = args.date or date.today().isoformat()
+    run_date = args.date or today_iso(load_config())
     args.channel = "indeed"
     ob = outbox_for(args)
     email_path = ob / f"{run_date}_email.json"
@@ -1091,53 +1279,59 @@ def stage_indeed_daily(args) -> int:
         return 0
     lock.parent.mkdir(parents=True, exist_ok=True)
     lock.write_text(str(os.getpid()))
-    log = log_for(run_date, args)
     try:
-        rc = recover_uncommitted(log, "indeed")
-        if rc != 0:
-            return rc
-        if not args.force and _read_json(email_path).get("sent_message_id"):
-            log("  today's indeed digest was already sent — nothing more to do")
-            return 0
-        if not (ob / f"{run_date}_candidates.json").exists():
-            log("! no indeed candidates for today — run indeed-ingest first")
-            return 1
-        try:
-            mailer_src.credentials(fetch.load_env(ROOT / ".env"))
-        except mailer_src.MailerError as exc:
-            log(f"! cannot send, so not starting: {exc}")
-            return 2
-
-        def mk(**kw):
-            return _ns(date=run_date, channel="indeed", **kw)
-
-        rc = stage_score(mk(dry_run=False, limit=0))
-        if rc != 0:
-            log(f"! score failed (rc={rc}) — nothing committed")
-            return rc
-        # Indeed discovery happens outside this process, so an empty scan is not a
-        # failure signal here — only a scorer that answered for nobody is.
-        problem = digest_health(ob, run_date, check_scanned=False)
-        if problem:
-            log(f"! {problem}. Nothing sent, nothing committed.")
-            return 4
-        for name, stage, a in (
-            ("render", stage_render, mk(scored=None, test=False)),
-            ("send", stage_send, mk()),
-        ):
-            rc = stage(a)
-            if rc != 0:
-                log(f"! {name} failed (rc={rc}) — nothing committed")
-                return rc
-        message_id = _read_json(email_path).get("sent_message_id")
-        if not message_id:
-            log("! send reported success but wrote no Message-ID — refusing to commit")
-            return 3
-        rc = stage_commit(mk(message_id=message_id))
-        log("########## indeed run complete" if rc == 0 else "! commit failed")
-        return rc
+        return _run_guarded("indeed", run_date, lambda: _indeed_stages(args, run_date))
     finally:
         lock.unlink(missing_ok=True)
+
+
+def _indeed_stages(args, run_date: str) -> int:
+    ob = outbox_for(args)
+    email_path = ob / f"{run_date}_email.json"
+    log = log_for(run_date, args)
+    rc = recover_uncommitted(log, "indeed")
+    if rc != 0:
+        return rc
+    if not args.force and _read_json(email_path).get("sent_message_id"):
+        log("  today's indeed digest was already sent — nothing more to do")
+        return 0
+    if not (ob / f"{run_date}_candidates.json").exists():
+        log("! no indeed candidates for today — run indeed-ingest first")
+        return 1
+    try:
+        mailer_src.credentials(fetch.load_env(ROOT / ".env"))
+    except mailer_src.MailerError as exc:
+        log(f"! cannot send, so not starting: {exc}")
+        return 2
+
+    def mk(**kw):
+        return _ns(date=run_date, channel="indeed", **kw)
+
+    rc = stage_score(mk(dry_run=False, limit=0))
+    if rc != 0:
+        log(f"! score failed (rc={rc}) — nothing committed")
+        return rc
+    # Indeed discovery happens outside this process, so an empty scan is not a
+    # failure signal here — only a scorer that answered for nobody is.
+    problem = digest_health(ob, run_date, check_scanned=False)
+    if problem:
+        log(f"! {problem}. Nothing sent, nothing committed.")
+        return 4
+    for name, stage, a in (
+        ("render", stage_render, mk(scored=None, test=False)),
+        ("send", stage_send, mk()),
+    ):
+        rc = stage(a)
+        if rc != 0:
+            log(f"! {name} failed (rc={rc}) — nothing committed")
+            return rc
+    message_id = _read_json(email_path).get("sent_message_id")
+    if not message_id:
+        log("! send reported success but wrote no Message-ID — refusing to commit")
+        return 3
+    rc = stage_commit(mk(message_id=message_id))
+    log("########## indeed run complete" if rc == 0 else "! commit failed")
+    return rc
 
 
 # ---------------------------------------------------------------------- status

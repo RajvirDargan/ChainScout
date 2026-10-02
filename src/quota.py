@@ -32,10 +32,14 @@ def day_key(on: date | None = None) -> str:
 class Quota:
     """Wraps an existing sqlite connection so the ledger lives beside the job store."""
 
-    def __init__(self, conn: sqlite3.Connection, config: dict, log=print):
+    def __init__(self, conn: sqlite3.Connection, config: dict, log=print,
+                 today: date | None = None):
         self.conn = conn
         self.config = config or {}
         self.log = log
+        # The caller's idea of "today" (the configured timezone), so the ledger's day
+        # rolls over with the run's own date rather than the machine's clock.
+        self.today = today
         self.conn.executescript(SCHEMA)
         self.conn.commit()
         self._blocked: set[str] = set()
@@ -58,7 +62,7 @@ class Quota:
         """What's left against each configured cap. Missing cap = unlimited (None)."""
         cfg = self.limits(source)
         out: dict[str, int | None] = {}
-        for key, period in (("daily", day_key()), ("monthly", month_key())):
+        for key, period in (("daily", day_key(self.today)), ("monthly", month_key(self.today))):
             cap = _cap_for(cfg, key)
             out[key] = None if cap is None else max(0, cap - self.used(source, period))
         return out
@@ -77,7 +81,7 @@ class Quota:
             return False
 
         cfg = self.limits(source)
-        for key, period in (("daily", day_key()), ("monthly", month_key())):
+        for key, period in (("daily", day_key(self.today)), ("monthly", month_key(self.today))):
             cap = _cap_for(cfg, key)
             if cap is None:
                 continue
@@ -89,7 +93,7 @@ class Quota:
                 )
                 return False
 
-        for period in (day_key(), month_key()):
+        for period in (day_key(self.today), month_key(self.today)):
             self.conn.execute(
                 """INSERT INTO quota (source, period, used) VALUES (?,?,?)
                    ON CONFLICT(source, period) DO UPDATE SET used = used + excluded.used""",
@@ -100,7 +104,7 @@ class Quota:
 
     def refund(self, source: str, n: int = 1):
         """Give back an unspent reservation (e.g. the request never left the process)."""
-        for period in (day_key(), month_key()):
+        for period in (day_key(self.today), month_key(self.today)):
             self.conn.execute(
                 "UPDATE quota SET used = MAX(0, used - ?) WHERE source = ? AND period = ?",
                 (n, source, period),
@@ -118,7 +122,7 @@ class Quota:
         if delta < 0:
             self.refund(source, -delta)
             return
-        for period in (day_key(), month_key()):
+        for period in (day_key(self.today), month_key(self.today)):
             self.conn.execute(
                 """INSERT INTO quota (source, period, used) VALUES (?,?,?)
                    ON CONFLICT(source, period) DO UPDATE SET used = used + excluded.used""",
@@ -136,12 +140,16 @@ class Quota:
                 continue
             cfg = self.limits(source)
             bits = []
-            for key, period in (("daily", day_key()), ("monthly", month_key())):
+            for key, period in (("daily", day_key(self.today)), ("monthly", month_key(self.today))):
                 cap = _cap_for(cfg, key)
                 if cap is not None:
                     bits.append(f"{key} {self.used(source, period)}/{cap}")
             lines.append(f"  {source:10} " + (", ".join(bits) or "no cap"))
         return lines
+
+    def exhausted(self) -> list[str]:
+        """Sources that hit a cap during this run (disabled ones are not counted)."""
+        return sorted({k.split(":", 1)[0] for k in self._blocked if ":" in k})
 
     def _warn_once(self, key: str, msg: str):
         if key not in self._blocked:

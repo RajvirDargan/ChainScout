@@ -4,7 +4,14 @@
 # Everyone who gets the digest. Add or remove a line to change the distribution.
 recipients:
   - you@example.com
+# The run's own clock: the digest date, the 07:30 guard and the daily quota ledger all
+# follow this zone, not whatever the machine happens to be set to.
 timezone: Europe/Amsterdam
+
+# A run that fails to deliver emails the recipients once that day (with the log tail),
+# instead of failing silently. Set enabled: false to rely on the logs alone.
+alerts:
+  enabled: true
 
 # The digest should land in the morning, but the machine is often asleep or off at
 # 07:30. launchd fires at this time, at login, and hourly as a catch-up net; `daily`
@@ -40,6 +47,9 @@ thresholds:
   # freshness window — the cap is spent round-robin across all configured
   # geographies, so raising it doesn't disadvantage the top-priority one.
   max_candidates_per_run: 120
+  # A role that has sat in the queue this long without making an email (crowded out
+  # by higher scorers, or never scorable) is retired rather than carried forever.
+  carry_forward_max_days: 21
 
 deadlines:
   # Drives the countdown in the email header. Point this at whatever real deadline
@@ -57,6 +67,9 @@ deadlines:
 llm:
   backend: antigravity        # antigravity | gemini_api
   batch_size: 10              # jobs per scoring call — ~9 calls/day instead of ~210
+  # Wall-clock budget for the whole scoring pass. Whatever is left when it runs out
+  # carries into tomorrow rather than holding the run (and its lock) for hours.
+  max_scoring_seconds: 1800
   antigravity:
     # Absolute path on purpose: launchd gets no shell profile, so "agy" alone
     # resolves in your terminal but NOT in a scheduled run.
