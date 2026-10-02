@@ -34,7 +34,26 @@ collect  →  score  →  render  →  send  →  commit
 
 Every stage is idempotent and dedup runs across three layers (canonical URL,
 fingerprint, fuzzy company-name matching) so the same posting arriving from three
-different sources on the same morning is only ever emailed once.
+different sources on the same morning is only ever emailed once. The fuzzy layer is
+geography-aware — the same title at a multinational in Germany and in Poland is two
+jobs — and an internship is never merged into the full-time role.
+
+### Reliability
+
+A failed or interrupted run costs a retry, never a lost or repeated role:
+
+- **A sent digest is always committed.** If the run dies between sending and marking
+  roles as sent, the next run finishes the commit instead of emailing them again.
+- **A broken run never looks like a quiet day.** If no source answered, or the scorer
+  was down, nothing is sent — no false "No new roles" — and the next hourly tick retries.
+- **Retries don't re-spend quota.** Collection runs once per day; a retry reuses it.
+- **Failures are loud.** A run that doesn't deliver emails the recipients once that
+  day with the log tail, and every digest carries a run-health footer (quota caps hit,
+  LinkedIn blocked or its markup changed, jobs left unscored, a stalled Indeed channel).
+- **The backlog is bounded.** Already-scored roles are never re-scored, unemailed
+  roles expire after 21 days, and scoring has a wall-clock budget.
+
+The details are in `RUNBOOK.md` under "When something goes wrong".
 
 ## Why this exists
 
@@ -66,7 +85,10 @@ against a spend ledger first so a bug can't blow through a free-tier quota.
 
 ## Getting started
 
+Requires Python 3.9+.
+
 ```bash
+pip install -r requirements.txt
 cp .env.example .env        # fill in your own API keys
 # edit PROFILE.md with your own background and rubric
 # edit config.yaml — at minimum, recipients: and the geographies you care about
@@ -78,8 +100,61 @@ python3 src/run.py daily               # the full chain
 See `RUNBOOK.md` for the full operator's guide, including the launchd scheduling
 setup in `launchd/`.
 
+## Project layout
+
+```
+config.yaml                 every tunable: geographies, titles, caps, thresholds, alerts
+PROFILE.md                  candidate profile + 0-100 scoring rubric (read by the scorer)
+PROFILE_INDIA_ADDENDUM.md   per-channel rubric override for the Indeed India digest
+RUNBOOK.md                  operator's guide: costs, scheduling, dedup, failure handling
+src/
+  run.py                    stage runner: collect, score, render, send, commit, daily
+  adzuna.py  linkedin.py    discovery adapters (Adzuna API, LinkedIn guest search)
+  fetch.py                  ATS boards (Greenhouse/Lever/Recruitee), Firecrawl, IND register
+  extract.py                job-page fetch + JSON-LD / Gemini / heuristic extraction
+  normalize.py              canonical URLs, fingerprints, geography and city matching
+  prescore.py               deterministic prescreen: seniority, years, language, salary
+  score.py  llm.py          batched LLM scoring; Antigravity CLI with Gemini API fallback
+  gemini.py                 structured extraction for pages without JSON-LD
+  quota.py                  spend ledger: every metered call reserves against a cap
+  store.py                  SQLite seen-store: dedup layers and job status
+  render.py  mailer.py      HTML/plain-text digest and SMTP delivery
+  indeed.py                 Indeed India channel (records handed over by a Claude task)
+templates/digest.html.j2    the email
+tests/                      pytest suite
+launchd/                    macOS scheduling (daily at 07:30, at login, hourly catch-up)
+state/  outbox/  logs/      created at runtime, gitignored
+```
+
+## Configuration knobs worth knowing
+
+Everything lives in `config.yaml`, commented in place. The ones added with the
+reliability work:
+
+| Key | Default | What it does |
+|---|---|---|
+| `timezone` | `Europe/Amsterdam` | The run's clock: digest date, the 07:30 guard and the daily quota ledger |
+| `alerts.enabled` | `true` | Email the recipients once a day when a run fails to deliver |
+| `thresholds.carry_forward_max_days` | `21` | Retire never-emailed roles after this many days in the queue |
+| `llm.max_scoring_seconds` | `1800` | Wall-clock budget for scoring; the rest carries forward |
+| `sources.linkedin_detail.daily_calls` | `150` | Cap on LinkedIn job-page fetches (paced like the search) |
+| `deadlines.label` | `sponsor-filing deadline` | How the countdown in the email header names `sponsor_filing` |
+| `geographies[].short_label`, `digest_heading` | — | Chip/subject label and "Beyond …" heading for a geography |
+
+## Testing
+
+```bash
+python3 -m pytest tests/ -q
+```
+
+The suite covers URL canonicalisation and the dedup layers, the prescreen gates, spend
+caps, the source adapters, the scorer and LLM chain, and the daily chain itself
+(send/commit recovery, the no-misleading-digest gate, collect order, alerts). It runs
+offline: sources, the LLM and SMTP are stubbed.
+
 ## Stack
 
-Python, `requests`, `pyyaml`, `jinja2`. No framework, no database beyond a local
-SQLite dedup store. LLM calls go through one small interface (`llm.py`) with two
-interchangeable backends.
+Python 3.9+ (standard-library `zoneinfo`, `sqlite3`, `smtplib`), `requests`, `pyyaml`,
+`jinja2`; `lxml` only for parsing the IND sponsor register. No framework, no database
+beyond a local SQLite dedup store. LLM calls go through one small interface (`llm.py`)
+with two interchangeable backends.
